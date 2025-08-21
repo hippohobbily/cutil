@@ -1,0 +1,18 @@
+# Claude-specific files
+.claude/
+CLAUDE.md
+
+# Build artifacts
+*.exe
+*.o
+*.obj
+writefile
+
+# Temporary files
+*.tmp
+*.bak
+*~
+
+# OS-specific files
+.DS_Store
+Thumbs.db

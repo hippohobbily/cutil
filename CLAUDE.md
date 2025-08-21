@@ -1,1 +1,0 @@
-- This is a project of C programs that can be run universally across all platforms to perform low level utility like write a 2G file.
