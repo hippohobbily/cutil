@@ -219,16 +219,26 @@ int write_file_pwrite(const char *filename, unsigned long long size) {
 #endif
 
 #if HAVE_WRITEV
+#include <limits.h>
+#ifndef IOV_MAX
+#ifdef _SC_IOV_MAX
+#define IOV_MAX sysconf(_SC_IOV_MAX)
+#else
+#define IOV_MAX 16  /* Conservative default for AIX */
+#endif
+#endif
+
 int write_file_writev(const char *filename, unsigned long long size) {
     int fd;
     struct iovec *iov;
-    int iovcnt;
+    int iovcnt, max_iov;
     size_t chunk_size = 1024 * 1024; /* 1MB chunks */
-    size_t remaining;
+    unsigned long long total_written = 0;
     ssize_t written;
     int i;
     char formatted_size[64];
     unsigned char *buffers;
+    int percent, last_percent = -1;
     
     fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0644);
     if (fd < 0) {
@@ -236,9 +246,23 @@ int write_file_writev(const char *filename, unsigned long long size) {
         return 1;
     }
     
-    /* Calculate number of iovec structures needed */
+    /* Get system's IOV_MAX limit */
+#ifdef _SC_IOV_MAX
+    max_iov = sysconf(_SC_IOV_MAX);
+    if (max_iov < 0) max_iov = 16; /* Fallback for AIX */
+#else
+    max_iov = IOV_MAX;
+#endif
+    
+    /* For AIX, use smaller chunks and fewer vectors */
+#ifdef _AIX
+    max_iov = (max_iov > 16) ? 16 : max_iov;  /* AIX typically works better with 16 or fewer */
+    chunk_size = 64 * 1024; /* 64KB chunks for AIX */
+#endif
+    
+    /* Calculate number of iovec structures needed per call */
     iovcnt = (size + chunk_size - 1) / chunk_size;
-    if (iovcnt > 1024) iovcnt = 1024; /* Limit to reasonable number */
+    if (iovcnt > max_iov) iovcnt = max_iov;
     
     iov = (struct iovec *)malloc(iovcnt * sizeof(struct iovec));
     if (iov == NULL) {
@@ -247,51 +271,75 @@ int write_file_writev(const char *filename, unsigned long long size) {
         return 1;
     }
     
-    /* Allocate all buffers */
-    buffers = (unsigned char *)malloc(size);
+    /* Allocate buffer for one batch of vectors */
+    size_t batch_size = iovcnt * chunk_size;
+    if (batch_size > size) batch_size = size;
+    
+    buffers = (unsigned char *)malloc(batch_size);
     if (buffers == NULL) {
-        fprintf(stderr, "Error: Cannot allocate %llu bytes\n", size);
+        fprintf(stderr, "Error: Cannot allocate %zu bytes\n", batch_size);
         free(iov);
         close(fd);
         return 1;
-    }
-    
-    /* Initialize buffer with pattern */
-    for (i = 0; i < size; i++) {
-        buffers[i] = (unsigned char)(i & 0xFF);
     }
     
     format_size(size, formatted_size, sizeof(formatted_size));
-    printf("Writing %s to file '%s' (writev mode with %d vectors)...\n", 
+    printf("Writing %s to file '%s' (writev mode, max %d vectors per call)...\n", 
            formatted_size, filename, iovcnt);
     
-    /* Setup iovec array */
-    remaining = size;
-    for (i = 0; i < iovcnt && remaining > 0; i++) {
-        size_t this_chunk = (remaining > chunk_size) ? chunk_size : remaining;
-        iov[i].iov_base = buffers + (i * chunk_size);
-        iov[i].iov_len = this_chunk;
-        remaining -= this_chunk;
+    /* Write in batches */
+    while (total_written < size) {
+        size_t remaining_in_batch = size - total_written;
+        if (remaining_in_batch > batch_size) remaining_in_batch = batch_size;
+        
+        /* Initialize buffer with pattern */
+        for (i = 0; i < remaining_in_batch; i++) {
+            buffers[i] = (unsigned char)((total_written + i) & 0xFF);
+        }
+        
+        /* Setup iovec array for this batch */
+        int vecs_this_batch = 0;
+        size_t bytes_in_batch = 0;
+        for (i = 0; i < iovcnt && bytes_in_batch < remaining_in_batch; i++) {
+            size_t this_chunk = (remaining_in_batch - bytes_in_batch > chunk_size) 
+                               ? chunk_size : (remaining_in_batch - bytes_in_batch);
+            iov[i].iov_base = buffers + bytes_in_batch;
+            iov[i].iov_len = this_chunk;
+            bytes_in_batch += this_chunk;
+            vecs_this_batch++;
+        }
+        
+        written = writev(fd, iov, vecs_this_batch);
+        if (written < 0) {
+            fprintf(stderr, "Error: writev failed: %s (errno=%d, vecs=%d)\n", 
+                    strerror(errno), errno, vecs_this_batch);
+            free(buffers);
+            free(iov);
+            close(fd);
+            return 1;
+        }
+        
+        if ((size_t)written != bytes_in_batch) {
+            fprintf(stderr, "Error: Partial write - wrote %zd bytes of %zu\n", 
+                    written, bytes_in_batch);
+            free(buffers);
+            free(iov);
+            close(fd);
+            return 1;
+        }
+        
+        total_written += written;
+        
+        /* Show progress */
+        percent = (int)((total_written * 100) / size);
+        if (percent != last_percent) {
+            printf("\rProgress: %d%%", percent);
+            fflush(stdout);
+            last_percent = percent;
+        }
     }
     
-    written = writev(fd, iov, i);
-    if (written < 0) {
-        fprintf(stderr, "Error: writev failed: %s\n", strerror(errno));
-        free(buffers);
-        free(iov);
-        close(fd);
-        return 1;
-    }
-    
-    if ((size_t)written != size) {
-        fprintf(stderr, "Error: Partial write - wrote %zd bytes of %llu\n", 
-                written, size);
-        free(buffers);
-        free(iov);
-        close(fd);
-        return 1;
-    }
-    
+    printf("\rProgress: 100%%\n");
     free(buffers);
     free(iov);
     close(fd);
@@ -305,13 +353,14 @@ int write_file_writev(const char *filename, unsigned long long size) {
 int write_file_pwritev(const char *filename, unsigned long long size) {
     int fd;
     struct iovec *iov;
-    int iovcnt;
+    int iovcnt, max_iov;
     size_t chunk_size = 1024 * 1024; /* 1MB chunks */
-    size_t remaining;
+    unsigned long long total_written = 0;
     ssize_t written;
     int i;
     char formatted_size[64];
     unsigned char *buffers;
+    int percent, last_percent = -1;
     
     fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0644);
     if (fd < 0) {
@@ -319,9 +368,17 @@ int write_file_pwritev(const char *filename, unsigned long long size) {
         return 1;
     }
     
-    /* Calculate number of iovec structures needed */
+    /* Get system's IOV_MAX limit */
+#ifdef _SC_IOV_MAX
+    max_iov = sysconf(_SC_IOV_MAX);
+    if (max_iov < 0) max_iov = 1024;
+#else
+    max_iov = 1024;
+#endif
+    
+    /* Calculate number of iovec structures needed per call */
     iovcnt = (size + chunk_size - 1) / chunk_size;
-    if (iovcnt > 1024) iovcnt = 1024; /* Limit to reasonable number */
+    if (iovcnt > max_iov) iovcnt = max_iov;
     
     iov = (struct iovec *)malloc(iovcnt * sizeof(struct iovec));
     if (iov == NULL) {
@@ -330,51 +387,75 @@ int write_file_pwritev(const char *filename, unsigned long long size) {
         return 1;
     }
     
-    /* Allocate all buffers */
-    buffers = (unsigned char *)malloc(size);
+    /* Allocate buffer for one batch of vectors */
+    size_t batch_size = iovcnt * chunk_size;
+    if (batch_size > size) batch_size = size;
+    
+    buffers = (unsigned char *)malloc(batch_size);
     if (buffers == NULL) {
-        fprintf(stderr, "Error: Cannot allocate %llu bytes\n", size);
+        fprintf(stderr, "Error: Cannot allocate %zu bytes\n", batch_size);
         free(iov);
         close(fd);
         return 1;
-    }
-    
-    /* Initialize buffer with pattern */
-    for (i = 0; i < size; i++) {
-        buffers[i] = (unsigned char)(i & 0xFF);
     }
     
     format_size(size, formatted_size, sizeof(formatted_size));
-    printf("Writing %s to file '%s' (pwritev mode with %d vectors)...\n", 
+    printf("Writing %s to file '%s' (pwritev mode, max %d vectors per call)...\n", 
            formatted_size, filename, iovcnt);
     
-    /* Setup iovec array */
-    remaining = size;
-    for (i = 0; i < iovcnt && remaining > 0; i++) {
-        size_t this_chunk = (remaining > chunk_size) ? chunk_size : remaining;
-        iov[i].iov_base = buffers + (i * chunk_size);
-        iov[i].iov_len = this_chunk;
-        remaining -= this_chunk;
+    /* Write in batches */
+    while (total_written < size) {
+        size_t remaining_in_batch = size - total_written;
+        if (remaining_in_batch > batch_size) remaining_in_batch = batch_size;
+        
+        /* Initialize buffer with pattern */
+        for (i = 0; i < remaining_in_batch; i++) {
+            buffers[i] = (unsigned char)((total_written + i) & 0xFF);
+        }
+        
+        /* Setup iovec array for this batch */
+        int vecs_this_batch = 0;
+        size_t bytes_in_batch = 0;
+        for (i = 0; i < iovcnt && bytes_in_batch < remaining_in_batch; i++) {
+            size_t this_chunk = (remaining_in_batch - bytes_in_batch > chunk_size) 
+                               ? chunk_size : (remaining_in_batch - bytes_in_batch);
+            iov[i].iov_base = buffers + bytes_in_batch;
+            iov[i].iov_len = this_chunk;
+            bytes_in_batch += this_chunk;
+            vecs_this_batch++;
+        }
+        
+        written = pwritev(fd, iov, vecs_this_batch, total_written);
+        if (written < 0) {
+            fprintf(stderr, "Error: pwritev failed: %s (errno=%d, vecs=%d)\n", 
+                    strerror(errno), errno, vecs_this_batch);
+            free(buffers);
+            free(iov);
+            close(fd);
+            return 1;
+        }
+        
+        if ((size_t)written != bytes_in_batch) {
+            fprintf(stderr, "Error: Partial write - wrote %zd bytes of %zu\n", 
+                    written, bytes_in_batch);
+            free(buffers);
+            free(iov);
+            close(fd);
+            return 1;
+        }
+        
+        total_written += written;
+        
+        /* Show progress */
+        percent = (int)((total_written * 100) / size);
+        if (percent != last_percent) {
+            printf("\rProgress: %d%%", percent);
+            fflush(stdout);
+            last_percent = percent;
+        }
     }
     
-    written = pwritev(fd, iov, i, 0); /* Write at offset 0 */
-    if (written < 0) {
-        fprintf(stderr, "Error: pwritev failed: %s\n", strerror(errno));
-        free(buffers);
-        free(iov);
-        close(fd);
-        return 1;
-    }
-    
-    if ((size_t)written != size) {
-        fprintf(stderr, "Error: Partial write - wrote %zd bytes of %llu\n", 
-                written, size);
-        free(buffers);
-        free(iov);
-        close(fd);
-        return 1;
-    }
-    
+    printf("\rProgress: 100%%\n");
     free(buffers);
     free(iov);
     close(fd);
