@@ -440,18 +440,19 @@ int write_file_stream(const char *filename, unsigned long long size) {
 }
 
 void print_usage(const char *program_name) {
-    printf("Usage: %s [-m|-p|-v|-pv] <size> <filename>\n", program_name);
+    printf("Usage: %s [-m|-p|-v|-pv|--pwritev] <size> <filename>\n", program_name);
     printf("\nWrite modes:\n");
-    printf("  (default) Stream mode using fwrite() with progress indicator\n");
-    printf("  -m        Malloc mode (allocate entire file in memory, single write())\n");
+    printf("  (default)  Stream mode using fwrite() with progress indicator\n");
+    printf("  -m         Malloc mode (allocate entire file in memory, single write())\n");
 #if HAVE_PWRITE
-    printf("  -p        Positioned write mode using pwrite() syscall\n");
+    printf("  -p         Positioned write mode using pwrite() syscall\n");
 #endif
 #if HAVE_WRITEV
-    printf("  -v        Vectored I/O mode using writev() syscall\n");
+    printf("  -v         Vectored I/O mode using writev() syscall\n");
 #endif
 #if HAVE_PWRITEV
-    printf("  -pv       Positioned vectored I/O using pwritev() syscall\n");
+    printf("  -pv        Positioned vectored I/O using pwritev() syscall\n");
+    printf("  --pwritev  Same as -pv\n");
 #endif
     printf("\nSize formats:\n");
     printf("  Decimal bytes:  1024\n");
@@ -503,13 +504,16 @@ int main(int argc, char *argv[]) {
         }
 #endif
 #if HAVE_PWRITEV
-        else if (strcmp(argv[1], "-pv") == 0) {
+        else if (strcmp(argv[1], "-pv") == 0 || strcmp(argv[1], "--pwritev") == 0) {
             mode = MODE_PWRITEV;
             arg_offset = 2;
         }
 #endif
         else {
             fprintf(stderr, "Error: Unknown option '%s'\n", argv[1]);
+#if !HAVE_PWRITEV
+            fprintf(stderr, "Note: -pv/--pwritev is not available on this platform\n");
+#endif
             print_usage(argv[0]);
             return 1;
         }
