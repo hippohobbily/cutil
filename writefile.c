@@ -48,7 +48,11 @@
  * Pattern: [offset_byte3][offset_byte2][offset_byte1][checksum_byte]
  * where checksum = (byte3 ^ byte2 ^ byte1) + 0x55
  */
+#ifdef _AIX
+static unsigned int generate_pattern(unsigned long long offset) {
+#else
 static inline unsigned int generate_pattern(unsigned long long offset) {
+#endif
     unsigned char b0 = (offset >> 16) & 0xFF;
     unsigned char b1 = (offset >> 8) & 0xFF;
     unsigned char b2 = offset & 0xFF;
@@ -169,22 +173,38 @@ int write_file_malloc(const char *filename, unsigned long long size) {
         return 1;
     }
     
-    printf("Writing %s to file '%s' (single write)...\n", formatted_size, filename);
+    printf("Writing %s to file '%s' (malloc mode)...\n", formatted_size, filename);
     
-    written = write(fd, buffer, size);
-    if (written < 0) {
-        fprintf(stderr, "Error: Write failed: %s\n", strerror(errno));
-        close(fd);
-        free(buffer);
-        return 1;
-    }
-    
-    if ((size_t)written != size) {
-        fprintf(stderr, "Error: Partial write - wrote %zd bytes of %llu\n", 
-                written, size);
-        close(fd);
-        free(buffer);
-        return 1;
+    size_t total_written = 0;
+    while (total_written < size) {
+        ssize_t written = write(fd, buffer + total_written, size - total_written);
+        if (written < 0) {
+            if (errno == EINTR) {
+                /* Interrupted by signal, retry */
+                continue;
+            }
+            fprintf(stderr, "Error: Write failed at %zu bytes: %s\n", 
+                    total_written, strerror(errno));
+            close(fd);
+            free(buffer);
+            return 1;
+        }
+        
+        if (written == 0) {
+            /* Shouldn't happen with regular files, but check anyway */
+            fprintf(stderr, "Error: Write returned 0 at %zu bytes\n", total_written);
+            close(fd);
+            free(buffer);
+            return 1;
+        }
+        
+        total_written += written;
+        
+        /* Show progress if partial write occurred */
+        if (total_written < size) {
+            printf("Partial write: wrote %zu of %llu bytes, continuing...\n", 
+                   total_written, size);
+        }
     }
     
     close(fd);
