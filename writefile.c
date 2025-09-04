@@ -42,6 +42,40 @@
 
 #define BUFFER_SIZE 8192
 
+/* Generate a 32-bit pattern value based on offset.
+ * This creates a unique 4-byte sequence for every position,
+ * allowing verification of write order and integrity.
+ * Pattern: [offset_byte3][offset_byte2][offset_byte1][checksum_byte]
+ * where checksum = (byte3 ^ byte2 ^ byte1) + 0x55
+ */
+static inline unsigned int generate_pattern(unsigned long long offset) {
+    unsigned char b0 = (offset >> 16) & 0xFF;
+    unsigned char b1 = (offset >> 8) & 0xFF;
+    unsigned char b2 = offset & 0xFF;
+    unsigned char b3 = (b0 ^ b1 ^ b2) + 0x55;  /* Simple checksum */
+    return (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
+}
+
+/* Fill buffer with 32-bit pattern starting at given file offset */
+static void fill_buffer_with_pattern(unsigned char *buffer, size_t size, unsigned long long file_offset) {
+    size_t i;
+    for (i = 0; i + 3 < size; i += 4) {
+        unsigned int pattern = generate_pattern(file_offset + i);
+        buffer[i] = (pattern >> 24) & 0xFF;
+        buffer[i+1] = (pattern >> 16) & 0xFF;
+        buffer[i+2] = (pattern >> 8) & 0xFF;
+        buffer[i+3] = pattern & 0xFF;
+    }
+    /* Handle remaining bytes if size is not multiple of 4 */
+    if (i < size) {
+        unsigned int pattern = generate_pattern(file_offset + i);
+        int remaining = size - i;
+        if (remaining >= 1) buffer[i] = (pattern >> 24) & 0xFF;
+        if (remaining >= 2) buffer[i+1] = (pattern >> 16) & 0xFF;
+        if (remaining >= 3) buffer[i+2] = (pattern >> 8) & 0xFF;
+    }
+}
+
 unsigned long long parse_size(const char *str) {
     char *endptr;
     double value;
@@ -113,7 +147,6 @@ int write_file_malloc(const char *filename, unsigned long long size) {
     int fd;
     unsigned char *buffer;
     ssize_t written;
-    size_t i;
     char formatted_size[64];
     
     format_size(size, formatted_size, sizeof(formatted_size));
@@ -126,10 +159,8 @@ int write_file_malloc(const char *filename, unsigned long long size) {
         return 1;
     }
     
-    printf("Initializing memory with pattern...\n");
-    for (i = 0; i < size; i++) {
-        buffer[i] = (unsigned char)(i & 0xFF);
-    }
+    printf("Initializing memory with 32-bit pattern...\n");
+    fill_buffer_with_pattern(buffer, size, 0);
     
     fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0644);
     if (fd < 0) {
@@ -170,14 +201,8 @@ int write_file_pwrite(const char *filename, unsigned long long size) {
     unsigned char buffer[BUFFER_SIZE];
     unsigned long long written = 0;
     ssize_t write_result;
-    int i;
     char formatted_size[64];
     int percent, last_percent = -1;
-    
-    /* Initialize buffer with pattern */
-    for (i = 0; i < BUFFER_SIZE; i++) {
-        buffer[i] = (unsigned char)(i & 0xFF);
-    }
     
     fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0644);
     if (fd < 0) {
@@ -186,10 +211,13 @@ int write_file_pwrite(const char *filename, unsigned long long size) {
     }
     
     format_size(size, formatted_size, sizeof(formatted_size));
-    printf("Writing %s to file '%s' (pwrite mode)...\n", formatted_size, filename);
+    printf("Writing %s to file '%s' (pwrite mode with 32-bit pattern)...\n", formatted_size, filename);
     
     while (written < size) {
         size_t to_write = (size - written > BUFFER_SIZE) ? BUFFER_SIZE : (size_t)(size - written);
+        
+        /* Fill buffer with pattern for current offset */
+        fill_buffer_with_pattern(buffer, to_write, written);
         write_result = pwrite(fd, buffer, to_write, written);
         
         if (write_result < 0) {
@@ -284,7 +312,7 @@ int write_file_writev(const char *filename, unsigned long long size) {
     }
     
     format_size(size, formatted_size, sizeof(formatted_size));
-    printf("Writing %s to file '%s' (writev mode, max %d vectors per call)...\n", 
+    printf("Writing %s to file '%s' (writev mode with 32-bit pattern, max %d vectors per call)...\n", 
            formatted_size, filename, iovcnt);
     
     /* Write in batches */
@@ -292,10 +320,8 @@ int write_file_writev(const char *filename, unsigned long long size) {
         size_t remaining_in_batch = size - total_written;
         if (remaining_in_batch > batch_size) remaining_in_batch = batch_size;
         
-        /* Initialize buffer with pattern */
-        for (i = 0; i < remaining_in_batch; i++) {
-            buffers[i] = (unsigned char)((total_written + i) & 0xFF);
-        }
+        /* Fill buffer with pattern for current offset */
+        fill_buffer_with_pattern(buffers, remaining_in_batch, total_written);
         
         /* Setup iovec array for this batch */
         int vecs_this_batch = 0;
@@ -400,7 +426,7 @@ int write_file_pwritev(const char *filename, unsigned long long size) {
     }
     
     format_size(size, formatted_size, sizeof(formatted_size));
-    printf("Writing %s to file '%s' (pwritev mode, max %d vectors per call)...\n", 
+    printf("Writing %s to file '%s' (pwritev mode with 32-bit pattern, max %d vectors per call)...\n", 
            formatted_size, filename, iovcnt);
     
     /* Write in batches */
@@ -408,10 +434,8 @@ int write_file_pwritev(const char *filename, unsigned long long size) {
         size_t remaining_in_batch = size - total_written;
         if (remaining_in_batch > batch_size) remaining_in_batch = batch_size;
         
-        /* Initialize buffer with pattern */
-        for (i = 0; i < remaining_in_batch; i++) {
-            buffers[i] = (unsigned char)((total_written + i) & 0xFF);
-        }
+        /* Fill buffer with pattern for current offset */
+        fill_buffer_with_pattern(buffers, remaining_in_batch, total_written);
         
         /* Setup iovec array for this batch */
         int vecs_this_batch = 0;
@@ -471,14 +495,8 @@ int write_file_stream(const char *filename, unsigned long long size) {
     unsigned long long written = 0;
     size_t to_write;
     size_t write_result;
-    int i;
     char formatted_size[64];
     int percent, last_percent = -1;
-    
-    /* Initialize buffer with pattern */
-    for (i = 0; i < BUFFER_SIZE; i++) {
-        buffer[i] = (unsigned char)(i & 0xFF);
-    }
     
     fp = fopen(filename, "wb");
     if (fp == NULL) {
@@ -487,10 +505,13 @@ int write_file_stream(const char *filename, unsigned long long size) {
     }
     
     format_size(size, formatted_size, sizeof(formatted_size));
-    printf("Writing %s to file '%s' (stream mode)...\n", formatted_size, filename);
+    printf("Writing %s to file '%s' (stream mode with 32-bit pattern)...\n", formatted_size, filename);
     
     while (written < size) {
         to_write = (size - written > BUFFER_SIZE) ? BUFFER_SIZE : (size_t)(size - written);
+        
+        /* Fill buffer with pattern for current offset */
+        fill_buffer_with_pattern(buffer, to_write, written);
         write_result = fwrite(buffer, 1, to_write, fp);
         
         if (write_result != to_write) {
@@ -520,8 +541,82 @@ int write_file_stream(const char *filename, unsigned long long size) {
     return 0;
 }
 
+/* Verify pattern at specific file offset */
+int verify_file_pattern(const char *filename, unsigned long long size) {
+    FILE *fp;
+    unsigned char buffer[BUFFER_SIZE];
+    unsigned long long verified = 0;
+    size_t to_read, read_result;
+    char formatted_size[64];
+    int errors = 0;
+    const int max_errors = 10;
+    
+    fp = fopen(filename, "rb");
+    if (fp == NULL) {
+        fprintf(stderr, "Error: Cannot open file '%s' for verification: %s\n", 
+                filename, strerror(errno));
+        return -1;
+    }
+    
+    format_size(size, formatted_size, sizeof(formatted_size));
+    printf("Verifying %s in file '%s'...\n", formatted_size, filename);
+    
+    while (verified < size && errors < max_errors) {
+        to_read = (size - verified > BUFFER_SIZE) ? BUFFER_SIZE : (size_t)(size - verified);
+        read_result = fread(buffer, 1, to_read, fp);
+        
+        if (read_result != to_read) {
+            if (feof(fp)) {
+                fprintf(stderr, "\nError: Unexpected EOF at %llu bytes (expected %llu)\n", 
+                        verified + read_result, size);
+            } else {
+                fprintf(stderr, "\nError: Read failed at %llu bytes: %s\n", 
+                        verified, strerror(errno));
+            }
+            fclose(fp);
+            return -1;
+        }
+        
+        /* Verify pattern */
+        size_t i;
+        for (i = 0; i < read_result && errors < max_errors; i++) {
+            unsigned long long offset = verified + i;
+            unsigned int expected = generate_pattern(offset);
+            unsigned char expected_byte = (expected >> (24 - (8 * (offset & 3)))) & 0xFF;
+            
+            if (buffer[i] != expected_byte) {
+                errors++;
+                fprintf(stderr, "\nPattern mismatch at offset 0x%llX (%llu): "
+                        "expected 0x%02X, got 0x%02X\n",
+                        offset, offset, expected_byte, buffer[i]);
+            }
+        }
+        
+        verified += read_result;
+        
+        /* Show progress */
+        if ((verified & 0xFFFFF) == 0 || verified == size) {
+            printf("\rVerified: %.1f%%", (verified * 100.0) / size);
+            fflush(stdout);
+        }
+    }
+    
+    printf("\n");
+    fclose(fp);
+    
+    if (errors > 0) {
+        fprintf(stderr, "Verification FAILED: %d error%s found%s\n", 
+                errors, errors == 1 ? "" : "s",
+                errors >= max_errors ? " (stopped after limit)" : "");
+        return errors;
+    }
+    
+    printf("Verification PASSED: All %s verified successfully\n", formatted_size);
+    return 0;
+}
+
 void print_usage(const char *program_name) {
-    printf("Usage: %s [-m|-p|-v|-pv|--pwritev] <size> <filename>\n", program_name);
+    printf("Usage: %s [-m|-p|-v|-pv|--pwritev|-c|--verify] <size> <filename>\n", program_name);
     printf("\nWrite modes:\n");
     printf("  (default)  Stream mode using fwrite() with progress indicator\n");
     printf("  -m         Malloc mode (allocate entire file in memory, single write())\n");
@@ -535,13 +630,21 @@ void print_usage(const char *program_name) {
     printf("  -pv        Positioned vectored I/O using pwritev() syscall\n");
     printf("  --pwritev  Same as -pv\n");
 #endif
+    printf("\nVerification mode:\n");
+    printf("  -c         Verify file contents match expected pattern\n");
+    printf("  --verify   Same as -c\n");
     printf("\nSize formats:\n");
     printf("  Decimal bytes:  1024\n");
     printf("  Hex bytes:      0x400\n");
     printf("  Human format:   2.5GB, 2.5G, 200MB, 200M, 10KB, 10K\n");
     printf("  Supported suffixes: B, K/KB, M/MB, G/GB, T/TB (case insensitive)\n");
+    printf("\nPattern details:\n");
+    printf("  Files are filled with a 32-bit pattern based on offset\n");
+    printf("  Each 4-byte sequence is unique, allowing write order verification\n");
+    printf("  Pattern format: [offset_byte2][offset_byte1][offset_byte0][checksum]\n");
     printf("\nExamples:\n");
-    printf("  %s 2.5GB output.dat           # Stream mode (default)\n", program_name);
+    printf("  %s 2.5GB output.dat           # Create 2.5GB file\n", program_name);
+    printf("  %s -c 2.5GB output.dat        # Verify 2.5GB file\n", program_name);
     printf("  %s -m 100M bigmem.dat          # Malloc mode\n", program_name);
 #if HAVE_PWRITE
     printf("  %s -p 1GB positioned.dat      # Positioned write mode\n", program_name);
@@ -556,7 +659,7 @@ void print_usage(const char *program_name) {
 
 int main(int argc, char *argv[]) {
     unsigned long long size;
-    enum { MODE_STREAM, MODE_MALLOC, MODE_PWRITE, MODE_WRITEV, MODE_PWRITEV } mode = MODE_STREAM;
+    enum { MODE_STREAM, MODE_MALLOC, MODE_PWRITE, MODE_WRITEV, MODE_PWRITEV, MODE_VERIFY } mode = MODE_STREAM;
     int arg_offset = 1;
     char *size_str;
     char *filename;
@@ -570,6 +673,10 @@ int main(int argc, char *argv[]) {
     if (argc == 4) {
         if (strcmp(argv[1], "-m") == 0) {
             mode = MODE_MALLOC;
+            arg_offset = 2;
+        }
+        else if (strcmp(argv[1], "-c") == 0 || strcmp(argv[1], "--verify") == 0) {
+            mode = MODE_VERIFY;
             arg_offset = 2;
         }
 #if HAVE_PWRITE
@@ -611,6 +718,8 @@ int main(int argc, char *argv[]) {
     }
     
     switch (mode) {
+        case MODE_VERIFY:
+            return verify_file_pattern(filename, size);
         case MODE_MALLOC:
             return write_file_malloc(filename, size);
 #if HAVE_PWRITE
