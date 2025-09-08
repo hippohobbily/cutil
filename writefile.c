@@ -44,6 +44,9 @@
 
 #define BUFFER_SIZE 8192
 
+/* Global verbose flag */
+static int verbose = 0;
+
 /* Generate a 32-bit pattern value based on offset.
  * This creates a unique 4-byte sequence for every position,
  * allowing verification of write order and integrity.
@@ -167,6 +170,10 @@ int write_file_malloc(const char *filename, unsigned long long size) {
     printf("Initializing memory with 32-bit pattern...\n");
     fill_buffer_with_pattern(buffer, size, 0);
     
+    if (verbose) {
+        printf("[VERBOSE] Opening file '%s' with open(O_WRONLY|O_CREAT|O_TRUNC, 0644)\n", filename);
+    }
+    
     fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0644);
     if (fd < 0) {
         fprintf(stderr, "Error: Cannot open file '%s': %s\n", filename, strerror(errno));
@@ -174,14 +181,38 @@ int write_file_malloc(const char *filename, unsigned long long size) {
         return 1;
     }
     
+    if (verbose) {
+        printf("[VERBOSE] File opened successfully, fd = %d\n", fd);
+    }
+    
     printf("Writing %s to file '%s' (malloc mode)...\n", formatted_size, filename);
     
     size_t total_written = 0;
+    int write_count = 0;
     while (total_written < size) {
-        ssize_t written = write(fd, buffer + total_written, size - total_written);
+        size_t to_write = size - total_written;
+        
+        if (verbose) {
+            printf("[VERBOSE] write() call #%d: fd=%d, buffer=%p+%zu, size=%zu\n", 
+                   ++write_count, fd, (void*)buffer, total_written, to_write);
+        }
+        
+        ssize_t written = write(fd, buffer + total_written, to_write);
+        
+        if (verbose) {
+            if (written >= 0) {
+                printf("[VERBOSE] write() returned: %zd bytes written\n", written);
+            } else {
+                printf("[VERBOSE] write() returned: -1 (errno=%d: %s)\n", errno, strerror(errno));
+            }
+        }
+        
         if (written < 0) {
             if (errno == EINTR) {
                 /* Interrupted by signal, retry */
+                if (verbose) {
+                    printf("[VERBOSE] write() interrupted by signal, retrying...\n");
+                }
                 continue;
             }
             fprintf(stderr, "Error: Write failed at %zu bytes: %s\n", 
@@ -208,6 +239,11 @@ int write_file_malloc(const char *filename, unsigned long long size) {
         }
     }
     
+    if (verbose) {
+        printf("[VERBOSE] Closing file with close(fd=%d)\n", fd);
+        printf("[VERBOSE] Total write() calls: %d\n", write_count);
+    }
+    
     close(fd);
     free(buffer);
     
@@ -224,11 +260,20 @@ int write_file_pwrite(const char *filename, unsigned long long size) {
     ssize_t write_result;
     char formatted_size[64];
     int percent, last_percent = -1;
+    int write_count = 0;
+    
+    if (verbose) {
+        printf("[VERBOSE] Opening file '%s' with open(O_WRONLY|O_CREAT|O_TRUNC, 0644)\n", filename);
+    }
     
     fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0644);
     if (fd < 0) {
         fprintf(stderr, "Error: Cannot open file '%s': %s\n", filename, strerror(errno));
         return 1;
+    }
+    
+    if (verbose) {
+        printf("[VERBOSE] File opened successfully, fd = %d\n", fd);
     }
     
     format_size(size, formatted_size, sizeof(formatted_size));
@@ -239,7 +284,17 @@ int write_file_pwrite(const char *filename, unsigned long long size) {
         
         /* Fill buffer with pattern for current offset */
         fill_buffer_with_pattern(buffer, to_write, written);
+        
+        if (verbose) {
+            printf("[VERBOSE] pwrite() call #%d: fd=%d, size=%zu, offset=%llu\n", 
+                   ++write_count, fd, to_write, written);
+        }
+        
         write_result = pwrite(fd, buffer, to_write, written);
+        
+        if (verbose) {
+            printf("[VERBOSE] pwrite() returned: %zd bytes written\n", write_result);
+        }
         
         if (write_result < 0) {
             fprintf(stderr, "\nError: pwrite failed at %llu bytes: %s\n", 
@@ -260,6 +315,12 @@ int write_file_pwrite(const char *filename, unsigned long long size) {
     }
     
     printf("\rProgress: 100%%\n");
+    
+    if (verbose) {
+        printf("[VERBOSE] Closing file with close(fd=%d)\n", fd);
+        printf("[VERBOSE] Total pwrite() calls: %d\n", write_count);
+    }
+    
     close(fd);
     
     printf("Successfully wrote %s to '%s' (pwrite mode)\n", formatted_size, filename);
@@ -288,11 +349,20 @@ int write_file_writev(const char *filename, unsigned long long size) {
     char formatted_size[64];
     unsigned char *buffers;
     int percent, last_percent = -1;
+    int writev_count = 0;
+    
+    if (verbose) {
+        printf("[VERBOSE] Opening file '%s' with open(O_WRONLY|O_CREAT|O_TRUNC, 0644)\n", filename);
+    }
     
     fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0644);
     if (fd < 0) {
         fprintf(stderr, "Error: Cannot open file '%s': %s\n", filename, strerror(errno));
         return 1;
+    }
+    
+    if (verbose) {
+        printf("[VERBOSE] File opened successfully, fd = %d\n", fd);
     }
     
     /* Get system's IOV_MAX limit */
@@ -312,6 +382,11 @@ int write_file_writev(const char *filename, unsigned long long size) {
     /* Calculate number of iovec structures needed per call */
     iovcnt = (size + chunk_size - 1) / chunk_size;
     if (iovcnt > max_iov) iovcnt = max_iov;
+    
+    if (verbose) {
+        printf("[VERBOSE] writev configuration: chunk_size=%zu, max_vectors=%d, allocated_vectors=%d\n", 
+               chunk_size, max_iov, iovcnt);
+    }
     
     iov = (struct iovec *)malloc(iovcnt * sizeof(struct iovec));
     if (iov == NULL) {
@@ -356,7 +431,24 @@ int write_file_writev(const char *filename, unsigned long long size) {
             vecs_this_batch++;
         }
         
+        if (verbose) {
+            printf("[VERBOSE] writev() call #%d: fd=%d, vectors=%d, total_bytes=%zu, offset=%llu\n", 
+                   ++writev_count, fd, vecs_this_batch, bytes_in_batch, total_written);
+            for (i = 0; i < vecs_this_batch && i < 3; i++) {
+                printf("[VERBOSE]   iov[%d]: base=%p, len=%zu\n", 
+                       i, iov[i].iov_base, iov[i].iov_len);
+            }
+            if (vecs_this_batch > 3) {
+                printf("[VERBOSE]   ... (%d more vectors)\n", vecs_this_batch - 3);
+            }
+        }
+        
         written = writev(fd, iov, vecs_this_batch);
+        
+        if (verbose) {
+            printf("[VERBOSE] writev() returned: %zd bytes written\n", written);
+        }
+        
         if (written < 0) {
             fprintf(stderr, "Error: writev failed: %s (errno=%d, vecs=%d)\n", 
                     strerror(errno), errno, vecs_this_batch);
@@ -387,6 +479,12 @@ int write_file_writev(const char *filename, unsigned long long size) {
     }
     
     printf("\rProgress: 100%%\n");
+    
+    if (verbose) {
+        printf("[VERBOSE] Closing file with close(fd=%d)\n", fd);
+        printf("[VERBOSE] Total writev() calls: %d\n", writev_count);
+    }
+    
     free(buffers);
     free(iov);
     close(fd);
@@ -518,11 +616,20 @@ int write_file_stream(const char *filename, unsigned long long size) {
     size_t write_result;
     char formatted_size[64];
     int percent, last_percent = -1;
+    int write_count = 0;
+    
+    if (verbose) {
+        printf("[VERBOSE] Opening file '%s' with fopen(\"wb\")\n", filename);
+    }
     
     fp = fopen(filename, "wb");
     if (fp == NULL) {
         fprintf(stderr, "Error: Cannot open file '%s': %s\n", filename, strerror(errno));
         return 1;
+    }
+    
+    if (verbose) {
+        printf("[VERBOSE] File opened successfully, FILE* = %p\n", (void*)fp);
     }
     
     format_size(size, formatted_size, sizeof(formatted_size));
@@ -533,7 +640,17 @@ int write_file_stream(const char *filename, unsigned long long size) {
         
         /* Fill buffer with pattern for current offset */
         fill_buffer_with_pattern(buffer, to_write, written);
+        
+        if (verbose) {
+            printf("[VERBOSE] fwrite() call #%d: writing %zu bytes at offset %llu\n", 
+                   ++write_count, to_write, written);
+        }
+        
         write_result = fwrite(buffer, 1, to_write, fp);
+        
+        if (verbose) {
+            printf("[VERBOSE] fwrite() returned: %zu bytes written\n", write_result);
+        }
         
         if (write_result != to_write) {
             fprintf(stderr, "\nError: Write failed at %llu bytes: %s\n", 
@@ -554,6 +671,12 @@ int write_file_stream(const char *filename, unsigned long long size) {
     }
     
     printf("\rProgress: 100%%\n");
+    
+    if (verbose) {
+        printf("[VERBOSE] Closing file with fclose()\n");
+        printf("[VERBOSE] Total fwrite() calls: %d\n", write_count);
+    }
+    
     fclose(fp);
     
     format_size(written, formatted_size, sizeof(formatted_size));
@@ -637,7 +760,7 @@ int verify_file_pattern(const char *filename, unsigned long long size) {
 }
 
 void print_usage(const char *program_name) {
-    printf("Usage: %s [-m|-p|-v|-pv|--pwritev|-c|--verify|-w] <size> <filename>\n", program_name);
+    printf("Usage: %s [-m|-p|-v|-pv|--pwritev|-c|--verify|-w|-V] <size> <filename>\n", program_name);
     printf("\nWrite modes:\n");
     printf("  (default)  Stream mode using fwrite() with progress indicator\n");
     printf("  -m         Malloc mode (allocate entire file in memory, single write())\n");
@@ -656,6 +779,7 @@ void print_usage(const char *program_name) {
     printf("  --verify   Same as -c\n");
     printf("\nDebug options:\n");
     printf("  -w         Wait for /tmp/zcookie file before proceeding (for debug setup)\n");
+    printf("  -V         Verbose mode - print system calls and details\n");
     printf("\nSize formats:\n");
     printf("  Decimal bytes:  1024\n");
     printf("  Hex bytes:      0x400\n");
@@ -697,6 +821,10 @@ int main(int argc, char *argv[]) {
     while (arg_offset < argc - 2) {
         if (strcmp(argv[arg_offset], "-w") == 0) {
             wait_for_cookie = 1;
+            arg_offset++;
+        }
+        else if (strcmp(argv[arg_offset], "-V") == 0) {
+            verbose = 1;
             arg_offset++;
         }
         else if (strcmp(argv[arg_offset], "-m") == 0) {
