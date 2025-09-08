@@ -47,6 +47,28 @@
 /* Global verbose flag */
 static int verbose = 0;
 
+/* Global wait for cookie flag */
+static int wait_for_cookie = 0;
+
+/* Wait for debug cookie if requested */
+static void wait_for_debug_cookie(void) {
+    if (wait_for_cookie) {
+        struct stat st;
+        printf("Waiting for /tmp/zcookie file before write (for debug setup)...\n");
+        printf("Create the file with: touch /tmp/zcookie\n");
+        fflush(stdout);
+        
+        while (stat("/tmp/zcookie", &st) != 0) {
+            /* File doesn't exist yet, wait 1 second and check again */
+            sleep(1);
+        }
+        
+        printf("Cookie file detected, proceeding with write...\n");
+        /* Optionally remove the cookie file */
+        unlink("/tmp/zcookie");
+    }
+}
+
 /* Generate a 32-bit pattern value based on offset.
  * This creates a unique 4-byte sequence for every position,
  * allowing verification of write order and integrity.
@@ -187,6 +209,9 @@ int write_file_malloc(const char *filename, unsigned long long size) {
     
     printf("Writing %s to file '%s' (malloc mode)...\n", formatted_size, filename);
     
+    /* Wait for debug cookie right before write operations */
+    wait_for_debug_cookie();
+    
     size_t total_written = 0;
     int write_count = 0;
     while (total_written < size) {
@@ -278,6 +303,9 @@ int write_file_pwrite(const char *filename, unsigned long long size) {
     
     format_size(size, formatted_size, sizeof(formatted_size));
     printf("Writing %s to file '%s' (pwrite mode with 32-bit pattern)...\n", formatted_size, filename);
+    
+    /* Wait for debug cookie right before write operations */
+    wait_for_debug_cookie();
     
     while (written < size) {
         size_t to_write = (size - written > BUFFER_SIZE) ? BUFFER_SIZE : (size_t)(size - written);
@@ -410,6 +438,9 @@ int write_file_writev(const char *filename, unsigned long long size) {
     format_size(size, formatted_size, sizeof(formatted_size));
     printf("Writing %s to file '%s' (writev mode with 32-bit pattern, max %d vectors per call)...\n", 
            formatted_size, filename, iovcnt);
+    
+    /* Wait for debug cookie right before write operations */
+    wait_for_debug_cookie();
     
     /* Write in batches */
     while (total_written < size) {
@@ -548,6 +579,9 @@ int write_file_pwritev(const char *filename, unsigned long long size) {
     printf("Writing %s to file '%s' (pwritev mode with 32-bit pattern, max %d vectors per call)...\n", 
            formatted_size, filename, iovcnt);
     
+    /* Wait for debug cookie right before write operations */
+    wait_for_debug_cookie();
+    
     /* Write in batches */
     while (total_written < size) {
         size_t remaining_in_batch = size - total_written;
@@ -634,6 +668,9 @@ int write_file_stream(const char *filename, unsigned long long size) {
     
     format_size(size, formatted_size, sizeof(formatted_size));
     printf("Writing %s to file '%s' (stream mode with 32-bit pattern)...\n", formatted_size, filename);
+    
+    /* Wait for debug cookie right before write operations */
+    wait_for_debug_cookie();
     
     while (written < size) {
         to_write = (size - written > BUFFER_SIZE) ? BUFFER_SIZE : (size_t)(size - written);
@@ -810,7 +847,6 @@ int main(int argc, char *argv[]) {
     int arg_offset = 1;
     char *size_str;
     char *filename;
-    int wait_for_cookie = 0;
     
     if (argc < 3) {
         print_usage(argv[0]);
@@ -917,23 +953,6 @@ int main(int argc, char *argv[]) {
     
     size_str = argv[arg_offset];
     filename = argv[arg_offset + 1];
-    
-    /* Wait for cookie file if requested */
-    if (wait_for_cookie) {
-        struct stat st;
-        printf("Waiting for /tmp/zcookie file to proceed (for debug setup)...\n");
-        printf("Create the file with: touch /tmp/zcookie\n");
-        fflush(stdout);
-        
-        while (stat("/tmp/zcookie", &st) != 0) {
-            /* File doesn't exist yet, wait 1 second and check again */
-            sleep(1);
-        }
-        
-        printf("Cookie file detected, proceeding...\n");
-        /* Optionally remove the cookie file */
-        unlink("/tmp/zcookie");
-    }
     
     size = parse_size(size_str);
     if (size == 0) {
