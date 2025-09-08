@@ -9,6 +9,7 @@
 
 #ifdef _WIN32
 #include <io.h>
+#include <windows.h>  /* For Sleep() */
 #define open _open
 #define write _write
 #define close _close
@@ -16,6 +17,7 @@
 #define O_CREAT _O_CREAT
 #define O_WRONLY _O_WRONLY
 #define O_TRUNC _O_TRUNC
+#define sleep(x) Sleep((x) * 1000)  /* Windows Sleep uses milliseconds */
 /* Windows doesn't have pwrite/writev/pwritev */
 #define HAVE_PWRITE 0
 #define HAVE_WRITEV 0
@@ -150,7 +152,6 @@ void format_size(unsigned long long bytes, char *buffer, size_t bufsize) {
 int write_file_malloc(const char *filename, unsigned long long size) {
     int fd;
     unsigned char *buffer;
-    ssize_t written;
     char formatted_size[64];
     
     format_size(size, formatted_size, sizeof(formatted_size));
@@ -636,7 +637,7 @@ int verify_file_pattern(const char *filename, unsigned long long size) {
 }
 
 void print_usage(const char *program_name) {
-    printf("Usage: %s [-m|-p|-v|-pv|--pwritev|-c|--verify] <size> <filename>\n", program_name);
+    printf("Usage: %s [-m|-p|-v|-pv|--pwritev|-c|--verify|-w] <size> <filename>\n", program_name);
     printf("\nWrite modes:\n");
     printf("  (default)  Stream mode using fwrite() with progress indicator\n");
     printf("  -m         Malloc mode (allocate entire file in memory, single write())\n");
@@ -653,6 +654,8 @@ void print_usage(const char *program_name) {
     printf("\nVerification mode:\n");
     printf("  -c         Verify file contents match expected pattern\n");
     printf("  --verify   Same as -c\n");
+    printf("\nDebug options:\n");
+    printf("  -w         Wait for /tmp/zcookie file before proceeding (for debug setup)\n");
     printf("\nSize formats:\n");
     printf("  Decimal bytes:  1024\n");
     printf("  Hex bytes:      0x400\n");
@@ -683,44 +686,51 @@ int main(int argc, char *argv[]) {
     int arg_offset = 1;
     char *size_str;
     char *filename;
+    int wait_for_cookie = 0;
     
-    if (argc < 3 || argc > 4) {
+    if (argc < 3 || argc > 5) {
         print_usage(argv[0]);
         return 1;
     }
     
-    /* Check for mode flags */
-    if (argc == 4) {
-        if (strcmp(argv[1], "-m") == 0) {
-            mode = MODE_MALLOC;
-            arg_offset = 2;
+    /* Check for mode flags and options */
+    while (arg_offset < argc - 2) {
+        if (strcmp(argv[arg_offset], "-w") == 0) {
+            wait_for_cookie = 1;
+            arg_offset++;
         }
-        else if (strcmp(argv[1], "-c") == 0 || strcmp(argv[1], "--verify") == 0) {
+        else if (strcmp(argv[arg_offset], "-m") == 0) {
+            mode = MODE_MALLOC;
+            arg_offset++;
+        }
+        else if (strcmp(argv[arg_offset], "-c") == 0 || strcmp(argv[arg_offset], "--verify") == 0) {
             mode = MODE_VERIFY;
-            arg_offset = 2;
+            arg_offset++;
         }
 #if HAVE_PWRITE
-        else if (strcmp(argv[1], "-p") == 0) {
+        else if (strcmp(argv[arg_offset], "-p") == 0) {
             mode = MODE_PWRITE;
-            arg_offset = 2;
+            arg_offset++;
         }
 #endif
 #if HAVE_WRITEV
-        else if (strcmp(argv[1], "-v") == 0) {
+        else if (strcmp(argv[arg_offset], "-v") == 0) {
             mode = MODE_WRITEV;
-            arg_offset = 2;
+            arg_offset++;
         }
 #endif
 #if HAVE_PWRITEV
-        else if (strcmp(argv[1], "-pv") == 0 || strcmp(argv[1], "--pwritev") == 0) {
+        else if (strcmp(argv[arg_offset], "-pv") == 0 || strcmp(argv[arg_offset], "--pwritev") == 0) {
             mode = MODE_PWRITEV;
-            arg_offset = 2;
+            arg_offset++;
         }
 #endif
         else {
-            fprintf(stderr, "Error: Unknown option '%s'\n", argv[1]);
+            fprintf(stderr, "Error: Unknown option '%s'\n", argv[arg_offset]);
 #if !HAVE_PWRITEV
-            fprintf(stderr, "Note: -pv/--pwritev is not available on this platform\n");
+            if (strcmp(argv[arg_offset], "-pv") == 0 || strcmp(argv[arg_offset], "--pwritev") == 0) {
+                fprintf(stderr, "Note: -pv/--pwritev is not available on this platform\n");
+            }
 #endif
             print_usage(argv[0]);
             return 1;
@@ -729,6 +739,23 @@ int main(int argc, char *argv[]) {
     
     size_str = argv[arg_offset];
     filename = argv[arg_offset + 1];
+    
+    /* Wait for cookie file if requested */
+    if (wait_for_cookie) {
+        struct stat st;
+        printf("Waiting for /tmp/zcookie file to proceed (for debug setup)...\n");
+        printf("Create the file with: touch /tmp/zcookie\n");
+        fflush(stdout);
+        
+        while (stat("/tmp/zcookie", &st) != 0) {
+            /* File doesn't exist yet, wait 1 second and check again */
+            sleep(1);
+        }
+        
+        printf("Cookie file detected, proceeding...\n");
+        /* Optionally remove the cookie file */
+        unlink("/tmp/zcookie");
+    }
     
     size = parse_size(size_str);
     if (size == 0) {
