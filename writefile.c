@@ -812,7 +812,7 @@ int main(int argc, char *argv[]) {
     char *filename;
     int wait_for_cookie = 0;
     
-    if (argc < 3 || argc > 5) {
+    if (argc < 3) {
         print_usage(argv[0]);
         return 1;
     }
@@ -863,6 +863,13 @@ int main(int argc, char *argv[]) {
             print_usage(argv[0]);
             return 1;
         }
+    }
+    
+    /* Ensure we have exactly 2 arguments left (size and filename) */
+    if (arg_offset != argc - 2) {
+        fprintf(stderr, "Error: Expected <size> <filename> after options\n");
+        print_usage(argv[0]);
+        return 1;
     }
     
     size_str = argv[arg_offset];
