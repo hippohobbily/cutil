@@ -154,7 +154,7 @@ int write_file_malloc(const char *filename, unsigned long long size) {
     char formatted_size[64];
     
     format_size(size, formatted_size, sizeof(formatted_size));
-    printf("Allocating %s of memory...\n", formatted_size);
+    printf("Allocating %s (0x%llX bytes) of memory...\n", formatted_size, size);
     
     buffer = (unsigned char *)malloc(size);
     if (buffer == NULL) {
