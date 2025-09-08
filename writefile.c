@@ -193,7 +193,7 @@ int write_file_malloc(const char *filename, unsigned long long size) {
         size_t to_write = size - total_written;
         
         if (verbose) {
-            printf("[VERBOSE] write() call #%d: fd=%d, buffer=%p+%zu, size=%zu\n", 
+            printf("[VERBOSE] write() call #%d: fd=%d, buffer=%p+0x%zx, size=0x%zx\n", 
                    ++write_count, fd, (void*)buffer, total_written, to_write);
         }
         
@@ -201,7 +201,7 @@ int write_file_malloc(const char *filename, unsigned long long size) {
         
         if (verbose) {
             if (written >= 0) {
-                printf("[VERBOSE] write() returned: %zd bytes written\n", written);
+                printf("[VERBOSE] write() returned: 0x%zx bytes written\n", written);
             } else {
                 printf("[VERBOSE] write() returned: -1 (errno=%d: %s)\n", errno, strerror(errno));
             }
@@ -234,7 +234,7 @@ int write_file_malloc(const char *filename, unsigned long long size) {
         
         /* Show progress if partial write occurred */
         if (total_written < size) {
-            printf("Partial write: wrote %zu of %llu bytes, continuing...\n", 
+            printf("Partial write: wrote 0x%zx of 0x%llx bytes, continuing...\n", 
                    total_written, size);
         }
     }
@@ -286,14 +286,14 @@ int write_file_pwrite(const char *filename, unsigned long long size) {
         fill_buffer_with_pattern(buffer, to_write, written);
         
         if (verbose) {
-            printf("[VERBOSE] pwrite() call #%d: fd=%d, size=%zu, offset=%llu\n", 
+            printf("[VERBOSE] pwrite() call #%d: fd=%d, size=0x%zx, offset=0x%llx\n", 
                    ++write_count, fd, to_write, written);
         }
         
         write_result = pwrite(fd, buffer, to_write, written);
         
         if (verbose) {
-            printf("[VERBOSE] pwrite() returned: %zd bytes written\n", write_result);
+            printf("[VERBOSE] pwrite() returned: 0x%zx bytes written\n", write_result);
         }
         
         if (write_result < 0) {
@@ -384,7 +384,7 @@ int write_file_writev(const char *filename, unsigned long long size) {
     if (iovcnt > max_iov) iovcnt = max_iov;
     
     if (verbose) {
-        printf("[VERBOSE] writev configuration: chunk_size=%zu, max_vectors=%d, allocated_vectors=%d\n", 
+        printf("[VERBOSE] writev configuration: chunk_size=0x%zx, max_vectors=%d, allocated_vectors=%d\n", 
                chunk_size, max_iov, iovcnt);
     }
     
@@ -432,10 +432,10 @@ int write_file_writev(const char *filename, unsigned long long size) {
         }
         
         if (verbose) {
-            printf("[VERBOSE] writev() call #%d: fd=%d, vectors=%d, total_bytes=%zu, offset=%llu\n", 
+            printf("[VERBOSE] writev() call #%d: fd=%d, vectors=%d, total_bytes=0x%zx, offset=0x%llx\n", 
                    ++writev_count, fd, vecs_this_batch, bytes_in_batch, total_written);
             for (i = 0; i < vecs_this_batch && i < 3; i++) {
-                printf("[VERBOSE]   iov[%d]: base=%p, len=%zu\n", 
+                printf("[VERBOSE]   iov[%d]: base=%p, len=0x%zx\n", 
                        i, iov[i].iov_base, iov[i].iov_len);
             }
             if (vecs_this_batch > 3) {
@@ -446,7 +446,7 @@ int write_file_writev(const char *filename, unsigned long long size) {
         written = writev(fd, iov, vecs_this_batch);
         
         if (verbose) {
-            printf("[VERBOSE] writev() returned: %zd bytes written\n", written);
+            printf("[VERBOSE] writev() returned: 0x%zx bytes written\n", written);
         }
         
         if (written < 0) {
@@ -642,14 +642,14 @@ int write_file_stream(const char *filename, unsigned long long size) {
         fill_buffer_with_pattern(buffer, to_write, written);
         
         if (verbose) {
-            printf("[VERBOSE] fwrite() call #%d: writing %zu bytes at offset %llu\n", 
+            printf("[VERBOSE] fwrite() call #%d: writing 0x%zx bytes at offset 0x%llx\n", 
                    ++write_count, to_write, written);
         }
         
         write_result = fwrite(buffer, 1, to_write, fp);
         
         if (verbose) {
-            printf("[VERBOSE] fwrite() returned: %zu bytes written\n", write_result);
+            printf("[VERBOSE] fwrite() returned: 0x%zx bytes written\n", write_result);
         }
         
         if (write_result != to_write) {
@@ -817,8 +817,27 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     
+    /* Quick check for --debug-args flag */
+    int debug_args = 0;
+    int i;
+    for (i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--debug-args") == 0) {
+            debug_args = 1;
+            printf("[DEBUG-ARGS] Argument count: argc=%d\n", argc);
+            int j;
+            for (j = 0; j < argc; j++) {
+                printf("[DEBUG-ARGS]   argv[%d] = '%s'\n", j, argv[j]);
+            }
+            break;
+        }
+    }
+    
     /* Check for mode flags and options */
     while (arg_offset < argc - 2) {
+        if (debug_args) {
+            printf("[DEBUG-ARGS] Processing argv[%d]='%s', arg_offset=%d\n", 
+                   arg_offset, argv[arg_offset], arg_offset);
+        }
         if (strcmp(argv[arg_offset], "-w") == 0) {
             wait_for_cookie = 1;
             arg_offset++;
@@ -826,6 +845,15 @@ int main(int argc, char *argv[]) {
         else if (strcmp(argv[arg_offset], "-V") == 0) {
             verbose = 1;
             arg_offset++;
+            /* Enable argument parsing debug output when verbose is set */
+            if (verbose) {
+                int i;
+                printf("[VERBOSE] Argument parsing: argc=%d\n", argc);
+                for (i = 0; i < argc; i++) {
+                    printf("[VERBOSE]   argv[%d] = '%s'\n", i, argv[i]);
+                }
+                printf("[VERBOSE] Current arg_offset = %d\n", arg_offset);
+            }
         }
         else if (strcmp(argv[arg_offset], "-m") == 0) {
             mode = MODE_MALLOC;
@@ -853,6 +881,10 @@ int main(int argc, char *argv[]) {
             arg_offset++;
         }
 #endif
+        else if (strcmp(argv[arg_offset], "--debug-args") == 0) {
+            /* Already processed above, just skip it */
+            arg_offset++;
+        }
         else {
             fprintf(stderr, "Error: Unknown option '%s'\n", argv[arg_offset]);
 #if !HAVE_PWRITEV
@@ -866,8 +898,19 @@ int main(int argc, char *argv[]) {
     }
     
     /* Ensure we have exactly 2 arguments left (size and filename) */
+    if (verbose) {
+        printf("[VERBOSE] After parsing flags: arg_offset=%d, argc=%d, remaining=%d\n", 
+               arg_offset, argc, argc - arg_offset);
+        printf("[VERBOSE] Expected 2 remaining args (size, filename), got %d\n", 
+               argc - arg_offset);
+    }
+    
     if (arg_offset != argc - 2) {
         fprintf(stderr, "Error: Expected <size> <filename> after options\n");
+        if (verbose) {
+            fprintf(stderr, "[VERBOSE] arg_offset=%d, argc=%d, needed argc-2=%d\n", 
+                    arg_offset, argc, argc - 2);
+        }
         print_usage(argv[0]);
         return 1;
     }
