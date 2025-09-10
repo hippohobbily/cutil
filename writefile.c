@@ -50,6 +50,12 @@ static int verbose = 0;
 /* Global wait for cookie flag */
 static int wait_for_cookie = 0;
 
+/* Global chunking flag for malloc mode */
+static int use_chunking = 0;
+
+/* Maximum chunk size for chunking mode (slightly under 2GB) */
+#define MAX_CHUNK_SIZE 0x7fff0000ULL
+
 /* Wait for debug cookie if requested */
 static void wait_for_debug_cookie(void) {
     if (wait_for_cookie) {
@@ -212,10 +218,44 @@ int write_file_malloc(const char *filename, unsigned long long size) {
     /* Wait for debug cookie right before write operations */
     wait_for_debug_cookie();
     
+    /* Handle chunking if requested */
+    if (use_chunking && size > MAX_CHUNK_SIZE) {
+        printf("[CHUNKING] File size 0x%llx exceeds chunk limit 0x%llx\n", size, MAX_CHUNK_SIZE);
+        unsigned long long num_full_chunks = size / MAX_CHUNK_SIZE;
+        unsigned long long remainder = size % MAX_CHUNK_SIZE;
+        printf("[CHUNKING] Dividing into %llu chunks of 0x%llx bytes", num_full_chunks, MAX_CHUNK_SIZE);
+        if (remainder > 0) {
+            printf(" + 1 chunk of 0x%llx bytes", remainder);
+        }
+        printf("\n");
+        
+        /* Verbose output for each chunk */
+        if (verbose || use_chunking) {
+            unsigned long long offset = 0;
+            for (unsigned long long i = 0; i < num_full_chunks; i++) {
+                printf("[CHUNKING] Chunk %llu: offset=0x%llx, size=0x%llx\n", 
+                       i + 1, offset, MAX_CHUNK_SIZE);
+                offset += MAX_CHUNK_SIZE;
+            }
+            if (remainder > 0) {
+                printf("[CHUNKING] Chunk %llu: offset=0x%llx, size=0x%llx (remainder)\n", 
+                       num_full_chunks + 1, offset, remainder);
+            }
+        }
+    }
+    
     size_t total_written = 0;
     int write_count = 0;
     while (total_written < size) {
         size_t to_write = size - total_written;
+        
+        /* Apply chunking limit if enabled */
+        if (use_chunking && to_write > MAX_CHUNK_SIZE) {
+            to_write = MAX_CHUNK_SIZE;
+            if (verbose || use_chunking) {
+                printf("[CHUNKING] Limiting write size to 0x%zx bytes\n", to_write);
+            }
+        }
         
         if (verbose) {
             printf("[VERBOSE] write() call #%d: fd=%d, buffer=%p+0x%zx, size=0x%zx\n", 
@@ -267,6 +307,10 @@ int write_file_malloc(const char *filename, unsigned long long size) {
     if (verbose) {
         printf("[VERBOSE] Closing file with close(fd=%d)\n", fd);
         printf("[VERBOSE] Total write() calls: %d\n", write_count);
+    }
+    
+    if (use_chunking && write_count > 1) {
+        printf("[CHUNKING] Successfully wrote %s in %d chunks\n", formatted_size, write_count);
     }
     
     close(fd);
@@ -797,7 +841,7 @@ int verify_file_pattern(const char *filename, unsigned long long size) {
 }
 
 void print_usage(const char *program_name) {
-    printf("Usage: %s [-m|-p|-v|-pv|--pwritev|-c|--verify|-w|-V] <size> <filename>\n", program_name);
+    printf("Usage: %s [-m|-p|-v|-pv|--pwritev|-c|--verify|-w|-V|-C] <size> <filename>\n", program_name);
     printf("\nWrite modes:\n");
     printf("  (default)  Stream mode using fwrite() with progress indicator\n");
     printf("  -m         Malloc mode (allocate entire file in memory, single write())\n");
@@ -817,6 +861,8 @@ void print_usage(const char *program_name) {
     printf("\nDebug options:\n");
     printf("  -w         Wait for /tmp/zcookie file before proceeding (for debug setup)\n");
     printf("  -V         Verbose mode - print system calls and details\n");
+    printf("  -C         Chunking mode - divide writes into chunks not exceeding 0x%llx bytes\n", MAX_CHUNK_SIZE);
+    printf("             (only works with -m malloc mode)\n");
     printf("\nSize formats:\n");
     printf("  Decimal bytes:  1024\n");
     printf("  Hex bytes:      0x400\n");
@@ -889,6 +935,13 @@ int main(int argc, char *argv[]) {
                     printf("[VERBOSE]   argv[%d] = '%s'\n", i, argv[i]);
                 }
                 printf("[VERBOSE] Current arg_offset = %d\n", arg_offset);
+            }
+        }
+        else if (strcmp(argv[arg_offset], "-C") == 0) {
+            use_chunking = 1;
+            arg_offset++;
+            if (verbose) {
+                printf("[VERBOSE] Chunking mode enabled (max chunk size: 0x%llx)\n", MAX_CHUNK_SIZE);
             }
         }
         else if (strcmp(argv[arg_offset], "-m") == 0) {

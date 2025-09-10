@@ -1,0 +1,195 @@
+.TH WRITEFILE 1 "September 2025" "Version 1.0" "User Commands"
+.SH NAME
+writefile \- create files with specific sizes and patterns for testing
+.SH SYNOPSIS
+.B writefile
+[\fB\-m\fR|\fB\-p\fR|\fB\-v\fR|\fB\-pv\fR|\fB\-\-pwritev\fR|\fB\-c\fR|\fB\-\-verify\fR|\fB\-w\fR|\fB\-V\fR|\fB\-C\fR]
+.I size
+.I filename
+.SH DESCRIPTION
+.B writefile
+creates files of specific sizes filled with a deterministic 32-bit pattern based on file offset.
+This utility is designed for testing file I/O operations, filesystem performance, and verifying
+write integrity. Each 4-byte sequence in the file is unique to its position, allowing detection
+of write ordering issues or data corruption.
+.SH OPTIONS
+.SS Write Modes
+.TP
+.B (default)
+Stream mode using fwrite() with progress indicator. Uses buffered I/O for efficient writing.
+.TP
+.B \-m
+Malloc mode - allocates the entire file size in memory and performs a single write() operation.
+Useful for testing large single-write operations and memory allocation limits.
+.TP
+.B \-p
+Positioned write mode using pwrite() syscall (if available on platform).
+Writes data at specific file offsets without changing file position.
+.TP
+.B \-v
+Vectored I/O mode using writev() syscall (if available on platform).
+Writes multiple buffers in a single system call for improved efficiency.
+.TP
+.B \-pv, \-\-pwritev
+Positioned vectored I/O using pwritev() syscall (Linux/BSD specific).
+Combines positioned writes with vectored I/O.
+.SS Verification Mode
+.TP
+.B \-c, \-\-verify
+Verify that file contents match the expected 32-bit pattern.
+Reads the file and checks each byte against the expected pattern value.
+.SS Debug Options
+.TP
+.B \-w
+Wait for /tmp/zcookie file before proceeding with write operations.
+Useful for attaching debuggers or monitoring tools before I/O begins.
+Create the cookie file with: touch /tmp/zcookie
+.TP
+.B \-V
+Verbose mode - prints detailed information about system calls, including:
+.RS
+.IP \(bu 2
+File descriptor numbers
+.IP \(bu 2
+Buffer addresses and sizes
+.IP \(bu 2
+Return values from system calls
+.IP \(bu 2
+Error messages with errno values
+.RE
+.TP
+.B \-C
+Chunking mode - divides writes into chunks not exceeding 0x7fff0000 bytes (slightly under 2GB).
+Only works with \-m (malloc) mode. Useful for:
+.RS
+.IP \(bu 2
+Working around system limits on single write operations
+.IP \(bu 2
+Testing behavior with multiple write calls
+.IP \(bu 2
+Avoiding issues with very large single allocations
+.RE
+When enabled, displays chunk information including offset and size for each chunk.
+.SH SIZE FORMATS
+The size parameter accepts multiple formats:
+.TP
+.B Decimal bytes
+Plain number: 1024
+.TP
+.B Hexadecimal bytes
+With 0x prefix: 0x400
+.TP
+.B Human-readable format
+With suffix: 2.5GB, 2.5G, 200MB, 200M, 10KB, 10K
+.TP
+.B Supported suffixes
+.RS
+.IP \(bu 2
+B - bytes
+.IP \(bu 2
+K, KB - kilobytes (1024 bytes)
+.IP \(bu 2
+M, MB - megabytes (1024² bytes)
+.IP \(bu 2
+G, GB - gigabytes (1024³ bytes)
+.IP \(bu 2
+T, TB - terabytes (1024⁴ bytes)
+.RE
+All suffixes are case-insensitive.
+.SH PATTERN FORMAT
+Files are filled with a deterministic 32-bit pattern where each 4-byte sequence is unique
+to its file offset. The pattern format is:
+.PP
+.RS
+[offset_byte2][offset_byte1][offset_byte0][checksum]
+.RE
+.PP
+Where checksum = (byte2 ^ byte1 ^ byte0) + 0x55
+.PP
+This pattern allows:
+.RS
+.IP \(bu 2
+Verification of correct write ordering
+.IP \(bu 2
+Detection of data corruption or bit flips
+.IP \(bu 2
+Identification of partial or failed writes
+.IP \(bu 2
+Testing of filesystem and storage integrity
+.RE
+.SH EXAMPLES
+.TP
+.B writefile 2.5GB output.dat
+Create a 2.5GB file using default stream mode
+.TP
+.B writefile -m 100M bigmem.dat
+Allocate 100MB in memory and write in one operation
+.TP
+.B writefile -m -C 5G large.dat
+Write 5GB file using malloc mode with automatic chunking into <2GB pieces
+.TP
+.B writefile -p 1GB positioned.dat
+Use positioned writes (pwrite) to create 1GB file
+.TP
+.B writefile -v 500M vector.dat
+Use vectored I/O to create 500MB file
+.TP
+.B writefile -c 2.5GB output.dat
+Verify that output.dat contains correct pattern for 2.5GB
+.TP
+.B writefile -V -m 10M debug.dat
+Create 10MB file in verbose mode showing all system calls
+.TP
+.B writefile -w -m 1G wait.dat
+Wait for /tmp/zcookie before writing (for debug setup)
+.SH PLATFORM NOTES
+.SS AIX Compatibility
+The program includes specific optimizations for AIX:
+.RS
+.IP \(bu 2
+Avoids inline keyword usage
+.IP \(bu 2
+Uses conservative IOV_MAX limits (16 vectors)
+.IP \(bu 2
+Reduces chunk sizes for writev() operations to 64KB
+.RE
+.SS Feature Availability
+.RS
+.IP \(bu 2
+pwrite() - Available on POSIX.1-2001 compliant systems
+.IP \(bu 2
+writev() - Available on most Unix systems
+.IP \(bu 2
+pwritev() - Linux and BSD specific
+.RE
+The program automatically detects available features at compile time.
+.SH EXIT STATUS
+.TP
+.B 0
+Success - file created/verified successfully
+.TP
+.B 1
+Failure - error in arguments, file operations, or verification
+.SH FILES
+.TP
+.B /tmp/zcookie
+Cookie file for -w option to pause execution
+.SH LIMITATIONS
+.RS
+.IP \(bu 2
+Maximum single allocation in malloc mode depends on available system memory
+.IP \(bu 2
+Chunking mode (-C) only works with malloc mode (-m)
+.IP \(bu 2
+Some write modes may not be available on all platforms
+.IP \(bu 2
+Very large files may require chunking mode to avoid system limits
+.RE
+.SH AUTHOR
+Written for system testing and I/O verification purposes.
+.SH SEE ALSO
+.BR dd (1),
+.BR write (2),
+.BR pwrite (2),
+.BR writev (2),
+.BR fwrite (3)
