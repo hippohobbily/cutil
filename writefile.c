@@ -806,8 +806,13 @@ int verify_file_pattern(const char *filename, unsigned long long size) {
         size_t i;
         for (i = 0; i < read_result && errors < max_errors; i++) {
             unsigned long long offset = verified + i;
-            unsigned int expected = generate_pattern(offset);
-            unsigned char expected_byte = (expected >> (24 - (8 * (offset & 3)))) & 0xFF;
+            /* Pattern is generated per 4-byte block, starting at 4-byte aligned offset */
+            unsigned long long pattern_offset = offset & ~3ULL;  /* Round down to 4-byte boundary */
+            unsigned int pattern = generate_pattern(pattern_offset);
+            
+            /* Extract the correct byte from the 32-bit pattern */
+            int byte_index = offset & 3;  /* Which byte within the 4-byte pattern (0-3) */
+            unsigned char expected_byte = (pattern >> (24 - byte_index * 8)) & 0xFF;
             
             if (buffer[i] != expected_byte) {
                 errors++;
