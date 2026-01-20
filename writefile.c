@@ -280,7 +280,7 @@ int write_file_writev(const char *filename, unsigned long long size) {
     int fd;
     struct iovec *iov;
     int iovcnt, max_iov;
-    size_t chunk_size = 1024 * 1024; /* 1MB chunks */
+    size_t chunk_size;
     unsigned long long total_written = 0;
     ssize_t written;
     int i;
@@ -306,11 +306,13 @@ int write_file_writev(const char *filename, unsigned long long size) {
 #ifdef _AIX
     max_iov = (max_iov > 16) ? 16 : max_iov;  /* AIX typically works better with 16 or fewer */
     chunk_size = 64 * 1024; /* 64KB chunks for AIX */
+#else
+    /* Use 1.5GB chunk size for non-AIX systems */
+    chunk_size = (size_t)1536 * 1024 * 1024; /* 1.5GB chunks */
 #endif
     
-    /* Calculate number of iovec structures needed per call */
-    iovcnt = (size + chunk_size - 1) / chunk_size;
-    if (iovcnt > max_iov) iovcnt = max_iov;
+    /* Always use maximum vectors available */
+    iovcnt = max_iov;
     
     iov = (struct iovec *)malloc(iovcnt * sizeof(struct iovec));
     if (iov == NULL) {
@@ -319,9 +321,21 @@ int write_file_writev(const char *filename, unsigned long long size) {
         return 1;
     }
     
-    /* Allocate buffer for one batch of vectors */
-    size_t batch_size = iovcnt * chunk_size;
-    if (batch_size > size) batch_size = size;
+    /* Calculate actual chunk size based on max vectors and total size */
+    /* Adjust chunk_size if needed to fit within reasonable memory limits */
+    size_t batch_size = (size_t)iovcnt * chunk_size;
+    if (batch_size > size) {
+        batch_size = (size_t)size;
+        /* Recalculate chunk_size for smaller files */
+        chunk_size = (batch_size + iovcnt - 1) / iovcnt;
+    }
+    
+    /* Limit batch_size to avoid excessive memory allocation */
+    const size_t max_batch = (size_t)2ULL * 1024 * 1024 * 1024; /* 2GB max batch */
+    if (batch_size > max_batch) {
+        batch_size = max_batch;
+        chunk_size = batch_size / iovcnt;
+    }
     
     buffers = (unsigned char *)malloc(batch_size);
     if (buffers == NULL) {
@@ -332,8 +346,10 @@ int write_file_writev(const char *filename, unsigned long long size) {
     }
     
     format_size(size, formatted_size, sizeof(formatted_size));
-    printf("Writing %s to file '%s' (writev mode with 32-bit pattern, max %d vectors per call)...\n", 
-           formatted_size, filename, iovcnt);
+    char chunk_formatted[64];
+    format_size(chunk_size, chunk_formatted, sizeof(chunk_formatted));
+    printf("Writing %s to file '%s' (writev mode, %d vectors × %s chunks)...\n", 
+           formatted_size, filename, iovcnt, chunk_formatted);
     
     /* Write in batches */
     while (total_written < size) {
@@ -400,7 +416,7 @@ int write_file_pwritev(const char *filename, unsigned long long size) {
     int fd;
     struct iovec *iov;
     int iovcnt, max_iov;
-    size_t chunk_size = 1024 * 1024; /* 1MB chunks */
+    size_t chunk_size;
     unsigned long long total_written = 0;
     ssize_t written;
     int i;
@@ -422,9 +438,11 @@ int write_file_pwritev(const char *filename, unsigned long long size) {
     max_iov = 1024;
 #endif
     
-    /* Calculate number of iovec structures needed per call */
-    iovcnt = (size + chunk_size - 1) / chunk_size;
-    if (iovcnt > max_iov) iovcnt = max_iov;
+    /* Use 1.5GB chunk size */
+    chunk_size = (size_t)1536 * 1024 * 1024; /* 1.5GB chunks */
+    
+    /* Always use maximum vectors available */
+    iovcnt = max_iov;
     
     iov = (struct iovec *)malloc(iovcnt * sizeof(struct iovec));
     if (iov == NULL) {
@@ -433,9 +451,21 @@ int write_file_pwritev(const char *filename, unsigned long long size) {
         return 1;
     }
     
-    /* Allocate buffer for one batch of vectors */
-    size_t batch_size = iovcnt * chunk_size;
-    if (batch_size > size) batch_size = size;
+    /* Calculate actual chunk size based on max vectors and total size */
+    /* Adjust chunk_size if needed to fit within reasonable memory limits */
+    size_t batch_size = (size_t)iovcnt * chunk_size;
+    if (batch_size > size) {
+        batch_size = (size_t)size;
+        /* Recalculate chunk_size for smaller files */
+        chunk_size = (batch_size + iovcnt - 1) / iovcnt;
+    }
+    
+    /* Limit batch_size to avoid excessive memory allocation */
+    const size_t max_batch = (size_t)2ULL * 1024 * 1024 * 1024; /* 2GB max batch */
+    if (batch_size > max_batch) {
+        batch_size = max_batch;
+        chunk_size = batch_size / iovcnt;
+    }
     
     buffers = (unsigned char *)malloc(batch_size);
     if (buffers == NULL) {
@@ -446,8 +476,10 @@ int write_file_pwritev(const char *filename, unsigned long long size) {
     }
     
     format_size(size, formatted_size, sizeof(formatted_size));
-    printf("Writing %s to file '%s' (pwritev mode with 32-bit pattern, max %d vectors per call)...\n", 
-           formatted_size, filename, iovcnt);
+    char chunk_formatted[64];
+    format_size(chunk_size, chunk_formatted, sizeof(chunk_formatted));
+    printf("Writing %s to file '%s' (pwritev mode, %d vectors × %s chunks)...\n", 
+           formatted_size, filename, iovcnt, chunk_formatted);
     
     /* Write in batches */
     while (total_written < size) {
