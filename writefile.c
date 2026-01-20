@@ -9,6 +9,7 @@
 
 #ifdef _WIN32
 #include <io.h>
+#include <windows.h>  /* For Sleep() */
 #define open _open
 #define write _write
 #define close _close
@@ -16,6 +17,7 @@
 #define O_CREAT _O_CREAT
 #define O_WRONLY _O_WRONLY
 #define O_TRUNC _O_TRUNC
+#define sleep(x) Sleep((x) * 1000)  /* Windows Sleep uses milliseconds */
 /* Windows doesn't have pwrite/writev/pwritev */
 #define HAVE_PWRITE 0
 #define HAVE_WRITEV 0
@@ -41,6 +43,37 @@
 #endif
 
 #define BUFFER_SIZE 8192
+
+/* Global verbose flag */
+static int verbose = 0;
+
+/* Global wait for cookie flag */
+static int wait_for_cookie = 0;
+
+/* Global chunking flag for malloc mode */
+static int use_chunking = 0;
+
+/* Maximum chunk size for chunking mode (slightly under 2GB) */
+#define MAX_CHUNK_SIZE 0x7fff0000ULL
+
+/* Wait for debug cookie if requested */
+static void wait_for_debug_cookie(void) {
+    if (wait_for_cookie) {
+        struct stat st;
+        printf("Waiting for /tmp/zcookie file before write (for debug setup)...\n");
+        printf("Create the file with: touch /tmp/zcookie\n");
+        fflush(stdout);
+        
+        while (stat("/tmp/zcookie", &st) != 0) {
+            /* File doesn't exist yet, wait 1 second and check again */
+            sleep(1);
+        }
+        
+        printf("Cookie file detected, proceeding with write...\n");
+        /* Optionally remove the cookie file */
+        unlink("/tmp/zcookie");
+    }
+}
 
 /* Generate a 32-bit pattern value based on offset.
  * This creates a unique 4-byte sequence for every position,
@@ -150,11 +183,10 @@ void format_size(unsigned long long bytes, char *buffer, size_t bufsize) {
 int write_file_malloc(const char *filename, unsigned long long size) {
     int fd;
     unsigned char *buffer;
-    ssize_t written;
     char formatted_size[64];
     
     format_size(size, formatted_size, sizeof(formatted_size));
-    printf("Allocating %s of memory...\n", formatted_size);
+    printf("Allocating %s (0x%llX bytes) of memory...\n", formatted_size, size);
     
     buffer = (unsigned char *)malloc(size);
     if (buffer == NULL) {
@@ -166,6 +198,10 @@ int write_file_malloc(const char *filename, unsigned long long size) {
     printf("Initializing memory with 32-bit pattern...\n");
     fill_buffer_with_pattern(buffer, size, 0);
     
+    if (verbose) {
+        printf("[VERBOSE] Opening file '%s' with open(O_WRONLY|O_CREAT|O_TRUNC, 0644)\n", filename);
+    }
+    
     fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0644);
     if (fd < 0) {
         fprintf(stderr, "Error: Cannot open file '%s': %s\n", filename, strerror(errno));
@@ -173,14 +209,75 @@ int write_file_malloc(const char *filename, unsigned long long size) {
         return 1;
     }
     
+    if (verbose) {
+        printf("[VERBOSE] File opened successfully, fd = %d\n", fd);
+    }
+    
     printf("Writing %s to file '%s' (malloc mode)...\n", formatted_size, filename);
     
+    /* Wait for debug cookie right before write operations */
+    wait_for_debug_cookie();
+    
+    /* Handle chunking if requested */
+    if (use_chunking && size > MAX_CHUNK_SIZE) {
+        printf("[CHUNKING] File size 0x%llx exceeds chunk limit 0x%llx\n", size, MAX_CHUNK_SIZE);
+        unsigned long long num_full_chunks = size / MAX_CHUNK_SIZE;
+        unsigned long long remainder = size % MAX_CHUNK_SIZE;
+        printf("[CHUNKING] Dividing into %llu chunks of 0x%llx bytes", num_full_chunks, MAX_CHUNK_SIZE);
+        if (remainder > 0) {
+            printf(" + 1 chunk of 0x%llx bytes", remainder);
+        }
+        printf("\n");
+        
+        /* Verbose output for each chunk */
+        if (verbose || use_chunking) {
+            unsigned long long offset = 0;
+            for (unsigned long long i = 0; i < num_full_chunks; i++) {
+                printf("[CHUNKING] Chunk %llu: offset=0x%llx, size=0x%llx\n", 
+                       i + 1, offset, MAX_CHUNK_SIZE);
+                offset += MAX_CHUNK_SIZE;
+            }
+            if (remainder > 0) {
+                printf("[CHUNKING] Chunk %llu: offset=0x%llx, size=0x%llx (remainder)\n", 
+                       num_full_chunks + 1, offset, remainder);
+            }
+        }
+    }
+    
     size_t total_written = 0;
+    int write_count = 0;
     while (total_written < size) {
-        ssize_t written = write(fd, buffer + total_written, size - total_written);
+        size_t to_write = size - total_written;
+        
+        /* Apply chunking limit if enabled */
+        if (use_chunking && to_write > MAX_CHUNK_SIZE) {
+            to_write = MAX_CHUNK_SIZE;
+            if (verbose || use_chunking) {
+                printf("[CHUNKING] Limiting write size to 0x%zx bytes\n", to_write);
+            }
+        }
+        
+        if (verbose) {
+            printf("[VERBOSE] write() call #%d: fd=%d, buffer=%p+0x%zx, size=0x%zx\n", 
+                   ++write_count, fd, (void*)buffer, total_written, to_write);
+        }
+        
+        ssize_t written = write(fd, buffer + total_written, to_write);
+        
+        if (verbose) {
+            if (written >= 0) {
+                printf("[VERBOSE] write() returned: 0x%zx bytes written\n", written);
+            } else {
+                printf("[VERBOSE] write() returned: -1 (errno=%d: %s)\n", errno, strerror(errno));
+            }
+        }
+        
         if (written < 0) {
             if (errno == EINTR) {
                 /* Interrupted by signal, retry */
+                if (verbose) {
+                    printf("[VERBOSE] write() interrupted by signal, retrying...\n");
+                }
                 continue;
             }
             fprintf(stderr, "Error: Write failed at %zu bytes: %s\n", 
@@ -202,9 +299,18 @@ int write_file_malloc(const char *filename, unsigned long long size) {
         
         /* Show progress if partial write occurred */
         if (total_written < size) {
-            printf("Partial write: wrote %zu of %llu bytes, continuing...\n", 
+            printf("Partial write: wrote 0x%zx of 0x%llx bytes, continuing...\n", 
                    total_written, size);
         }
+    }
+    
+    if (verbose) {
+        printf("[VERBOSE] Closing file with close(fd=%d)\n", fd);
+        printf("[VERBOSE] Total write() calls: %d\n", write_count);
+    }
+    
+    if (use_chunking && write_count > 1) {
+        printf("[CHUNKING] Successfully wrote %s in %d chunks\n", formatted_size, write_count);
     }
     
     close(fd);
@@ -223,6 +329,11 @@ int write_file_pwrite(const char *filename, unsigned long long size) {
     ssize_t write_result;
     char formatted_size[64];
     int percent, last_percent = -1;
+    int write_count = 0;
+    
+    if (verbose) {
+        printf("[VERBOSE] Opening file '%s' with open(O_WRONLY|O_CREAT|O_TRUNC, 0644)\n", filename);
+    }
     
     fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0644);
     if (fd < 0) {
@@ -230,15 +341,32 @@ int write_file_pwrite(const char *filename, unsigned long long size) {
         return 1;
     }
     
+    if (verbose) {
+        printf("[VERBOSE] File opened successfully, fd = %d\n", fd);
+    }
+    
     format_size(size, formatted_size, sizeof(formatted_size));
     printf("Writing %s to file '%s' (pwrite mode with 32-bit pattern)...\n", formatted_size, filename);
+    
+    /* Wait for debug cookie right before write operations */
+    wait_for_debug_cookie();
     
     while (written < size) {
         size_t to_write = (size - written > BUFFER_SIZE) ? BUFFER_SIZE : (size_t)(size - written);
         
         /* Fill buffer with pattern for current offset */
         fill_buffer_with_pattern(buffer, to_write, written);
+        
+        if (verbose) {
+            printf("[VERBOSE] pwrite() call #%d: fd=%d, size=0x%zx, offset=0x%llx\n", 
+                   ++write_count, fd, to_write, written);
+        }
+        
         write_result = pwrite(fd, buffer, to_write, written);
+        
+        if (verbose) {
+            printf("[VERBOSE] pwrite() returned: 0x%zx bytes written\n", write_result);
+        }
         
         if (write_result < 0) {
             fprintf(stderr, "\nError: pwrite failed at %llu bytes: %s\n", 
@@ -259,6 +387,12 @@ int write_file_pwrite(const char *filename, unsigned long long size) {
     }
     
     printf("\rProgress: 100%%\n");
+    
+    if (verbose) {
+        printf("[VERBOSE] Closing file with close(fd=%d)\n", fd);
+        printf("[VERBOSE] Total pwrite() calls: %d\n", write_count);
+    }
+    
     close(fd);
     
     printf("Successfully wrote %s to '%s' (pwrite mode)\n", formatted_size, filename);
@@ -287,11 +421,20 @@ int write_file_writev(const char *filename, unsigned long long size) {
     char formatted_size[64];
     unsigned char *buffers;
     int percent, last_percent = -1;
+    int writev_count = 0;
+    
+    if (verbose) {
+        printf("[VERBOSE] Opening file '%s' with open(O_WRONLY|O_CREAT|O_TRUNC, 0644)\n", filename);
+    }
     
     fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0644);
     if (fd < 0) {
         fprintf(stderr, "Error: Cannot open file '%s': %s\n", filename, strerror(errno));
         return 1;
+    }
+    
+    if (verbose) {
+        printf("[VERBOSE] File opened successfully, fd = %d\n", fd);
     }
     
     /* Get system's IOV_MAX limit */
@@ -313,6 +456,11 @@ int write_file_writev(const char *filename, unsigned long long size) {
     
     /* Always use maximum vectors available */
     iovcnt = max_iov;
+    
+    if (verbose) {
+        printf("[VERBOSE] writev configuration: chunk_size=0x%zx, max_vectors=%d, allocated_vectors=%d\n", 
+               chunk_size, max_iov, iovcnt);
+    }
     
     iov = (struct iovec *)malloc(iovcnt * sizeof(struct iovec));
     if (iov == NULL) {
@@ -351,6 +499,9 @@ int write_file_writev(const char *filename, unsigned long long size) {
     printf("Writing %s to file '%s' (writev mode, %d vectors × %s chunks)...\n", 
            formatted_size, filename, iovcnt, chunk_formatted);
     
+    /* Wait for debug cookie right before write operations */
+    wait_for_debug_cookie();
+    
     /* Write in batches */
     while (total_written < size) {
         size_t remaining_in_batch = size - total_written;
@@ -371,7 +522,24 @@ int write_file_writev(const char *filename, unsigned long long size) {
             vecs_this_batch++;
         }
         
+        if (verbose) {
+            printf("[VERBOSE] writev() call #%d: fd=%d, vectors=%d, total_bytes=0x%zx, offset=0x%llx\n", 
+                   ++writev_count, fd, vecs_this_batch, bytes_in_batch, total_written);
+            for (i = 0; i < vecs_this_batch && i < 3; i++) {
+                printf("[VERBOSE]   iov[%d]: base=%p, len=0x%zx\n", 
+                       i, iov[i].iov_base, iov[i].iov_len);
+            }
+            if (vecs_this_batch > 3) {
+                printf("[VERBOSE]   ... (%d more vectors)\n", vecs_this_batch - 3);
+            }
+        }
+        
         written = writev(fd, iov, vecs_this_batch);
+        
+        if (verbose) {
+            printf("[VERBOSE] writev() returned: 0x%zx bytes written\n", written);
+        }
+        
         if (written < 0) {
             fprintf(stderr, "Error: writev failed: %s (errno=%d, vecs=%d)\n", 
                     strerror(errno), errno, vecs_this_batch);
@@ -402,6 +570,12 @@ int write_file_writev(const char *filename, unsigned long long size) {
     }
     
     printf("\rProgress: 100%%\n");
+    
+    if (verbose) {
+        printf("[VERBOSE] Closing file with close(fd=%d)\n", fd);
+        printf("[VERBOSE] Total writev() calls: %d\n", writev_count);
+    }
+    
     free(buffers);
     free(iov);
     close(fd);
@@ -481,6 +655,9 @@ int write_file_pwritev(const char *filename, unsigned long long size) {
     printf("Writing %s to file '%s' (pwritev mode, %d vectors × %s chunks)...\n", 
            formatted_size, filename, iovcnt, chunk_formatted);
     
+    /* Wait for debug cookie right before write operations */
+    wait_for_debug_cookie();
+    
     /* Write in batches */
     while (total_written < size) {
         size_t remaining_in_batch = size - total_written;
@@ -549,6 +726,11 @@ int write_file_stream(const char *filename, unsigned long long size) {
     size_t write_result;
     char formatted_size[64];
     int percent, last_percent = -1;
+    int write_count = 0;
+    
+    if (verbose) {
+        printf("[VERBOSE] Opening file '%s' with fopen(\"wb\")\n", filename);
+    }
     
     fp = fopen(filename, "wb");
     if (fp == NULL) {
@@ -556,15 +738,32 @@ int write_file_stream(const char *filename, unsigned long long size) {
         return 1;
     }
     
+    if (verbose) {
+        printf("[VERBOSE] File opened successfully, FILE* = %p\n", (void*)fp);
+    }
+    
     format_size(size, formatted_size, sizeof(formatted_size));
     printf("Writing %s to file '%s' (stream mode with 32-bit pattern)...\n", formatted_size, filename);
+    
+    /* Wait for debug cookie right before write operations */
+    wait_for_debug_cookie();
     
     while (written < size) {
         to_write = (size - written > BUFFER_SIZE) ? BUFFER_SIZE : (size_t)(size - written);
         
         /* Fill buffer with pattern for current offset */
         fill_buffer_with_pattern(buffer, to_write, written);
+        
+        if (verbose) {
+            printf("[VERBOSE] fwrite() call #%d: writing 0x%zx bytes at offset 0x%llx\n", 
+                   ++write_count, to_write, written);
+        }
+        
         write_result = fwrite(buffer, 1, to_write, fp);
+        
+        if (verbose) {
+            printf("[VERBOSE] fwrite() returned: 0x%zx bytes written\n", write_result);
+        }
         
         if (write_result != to_write) {
             fprintf(stderr, "\nError: Write failed at %llu bytes: %s\n", 
@@ -585,6 +784,12 @@ int write_file_stream(const char *filename, unsigned long long size) {
     }
     
     printf("\rProgress: 100%%\n");
+    
+    if (verbose) {
+        printf("[VERBOSE] Closing file with fclose()\n");
+        printf("[VERBOSE] Total fwrite() calls: %d\n", write_count);
+    }
+    
     fclose(fp);
     
     format_size(written, formatted_size, sizeof(formatted_size));
@@ -633,8 +838,13 @@ int verify_file_pattern(const char *filename, unsigned long long size) {
         size_t i;
         for (i = 0; i < read_result && errors < max_errors; i++) {
             unsigned long long offset = verified + i;
-            unsigned int expected = generate_pattern(offset);
-            unsigned char expected_byte = (expected >> (24 - (8 * (offset & 3)))) & 0xFF;
+            /* Pattern is generated per 4-byte block, starting at 4-byte aligned offset */
+            unsigned long long pattern_offset = offset & ~3ULL;  /* Round down to 4-byte boundary */
+            unsigned int pattern = generate_pattern(pattern_offset);
+            
+            /* Extract the correct byte from the 32-bit pattern */
+            int byte_index = offset & 3;  /* Which byte within the 4-byte pattern (0-3) */
+            unsigned char expected_byte = (pattern >> (24 - byte_index * 8)) & 0xFF;
             
             if (buffer[i] != expected_byte) {
                 errors++;
@@ -668,7 +878,7 @@ int verify_file_pattern(const char *filename, unsigned long long size) {
 }
 
 void print_usage(const char *program_name) {
-    printf("Usage: %s [-m|-p|-v|-pv|--pwritev|-c|--verify] <size> <filename>\n", program_name);
+    printf("Usage: %s [-m|-p|-v|-pv|--pwritev|-c|--verify|-w|-V|-C] <size> <filename>\n", program_name);
     printf("\nWrite modes:\n");
     printf("  (default)  Stream mode using fwrite() with progress indicator\n");
     printf("  -m         Malloc mode (allocate entire file in memory, single write())\n");
@@ -685,6 +895,11 @@ void print_usage(const char *program_name) {
     printf("\nVerification mode:\n");
     printf("  -c         Verify file contents match expected pattern\n");
     printf("  --verify   Same as -c\n");
+    printf("\nDebug options:\n");
+    printf("  -w         Wait for /tmp/zcookie file before proceeding (for debug setup)\n");
+    printf("  -V         Verbose mode - print system calls and details\n");
+    printf("  -C         Chunking mode - divide writes into chunks not exceeding 0x%llx bytes\n", MAX_CHUNK_SIZE);
+    printf("             (only works with -m malloc mode)\n");
     printf("\nSize formats:\n");
     printf("  Decimal bytes:  1024\n");
     printf("  Hex bytes:      0x400\n");
@@ -716,47 +931,114 @@ int main(int argc, char *argv[]) {
     char *size_str;
     char *filename;
     
-    if (argc < 3 || argc > 4) {
+    if (argc < 3) {
         print_usage(argv[0]);
         return 1;
     }
     
-    /* Check for mode flags */
-    if (argc == 4) {
-        if (strcmp(argv[1], "-m") == 0) {
-            mode = MODE_MALLOC;
-            arg_offset = 2;
+    /* Quick check for --debug-args flag */
+    int debug_args = 0;
+    int i;
+    for (i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--debug-args") == 0) {
+            debug_args = 1;
+            printf("[DEBUG-ARGS] Argument count: argc=%d\n", argc);
+            int j;
+            for (j = 0; j < argc; j++) {
+                printf("[DEBUG-ARGS]   argv[%d] = '%s'\n", j, argv[j]);
+            }
+            break;
         }
-        else if (strcmp(argv[1], "-c") == 0 || strcmp(argv[1], "--verify") == 0) {
+    }
+    
+    /* Check for mode flags and options */
+    while (arg_offset < argc - 2) {
+        if (debug_args) {
+            printf("[DEBUG-ARGS] Processing argv[%d]='%s', arg_offset=%d\n", 
+                   arg_offset, argv[arg_offset], arg_offset);
+        }
+        if (strcmp(argv[arg_offset], "-w") == 0) {
+            wait_for_cookie = 1;
+            arg_offset++;
+        }
+        else if (strcmp(argv[arg_offset], "-V") == 0) {
+            verbose = 1;
+            arg_offset++;
+            /* Enable argument parsing debug output when verbose is set */
+            if (verbose) {
+                int i;
+                printf("[VERBOSE] Argument parsing: argc=%d\n", argc);
+                for (i = 0; i < argc; i++) {
+                    printf("[VERBOSE]   argv[%d] = '%s'\n", i, argv[i]);
+                }
+                printf("[VERBOSE] Current arg_offset = %d\n", arg_offset);
+            }
+        }
+        else if (strcmp(argv[arg_offset], "-C") == 0) {
+            use_chunking = 1;
+            arg_offset++;
+            if (verbose) {
+                printf("[VERBOSE] Chunking mode enabled (max chunk size: 0x%llx)\n", MAX_CHUNK_SIZE);
+            }
+        }
+        else if (strcmp(argv[arg_offset], "-m") == 0) {
+            mode = MODE_MALLOC;
+            arg_offset++;
+        }
+        else if (strcmp(argv[arg_offset], "-c") == 0 || strcmp(argv[arg_offset], "--verify") == 0) {
             mode = MODE_VERIFY;
-            arg_offset = 2;
+            arg_offset++;
         }
 #if HAVE_PWRITE
-        else if (strcmp(argv[1], "-p") == 0) {
+        else if (strcmp(argv[arg_offset], "-p") == 0) {
             mode = MODE_PWRITE;
-            arg_offset = 2;
+            arg_offset++;
         }
 #endif
 #if HAVE_WRITEV
-        else if (strcmp(argv[1], "-v") == 0) {
+        else if (strcmp(argv[arg_offset], "-v") == 0) {
             mode = MODE_WRITEV;
-            arg_offset = 2;
+            arg_offset++;
         }
 #endif
 #if HAVE_PWRITEV
-        else if (strcmp(argv[1], "-pv") == 0 || strcmp(argv[1], "--pwritev") == 0) {
+        else if (strcmp(argv[arg_offset], "-pv") == 0 || strcmp(argv[arg_offset], "--pwritev") == 0) {
             mode = MODE_PWRITEV;
-            arg_offset = 2;
+            arg_offset++;
         }
 #endif
+        else if (strcmp(argv[arg_offset], "--debug-args") == 0) {
+            /* Already processed above, just skip it */
+            arg_offset++;
+        }
         else {
-            fprintf(stderr, "Error: Unknown option '%s'\n", argv[1]);
+            fprintf(stderr, "Error: Unknown option '%s'\n", argv[arg_offset]);
 #if !HAVE_PWRITEV
-            fprintf(stderr, "Note: -pv/--pwritev is not available on this platform\n");
+            if (strcmp(argv[arg_offset], "-pv") == 0 || strcmp(argv[arg_offset], "--pwritev") == 0) {
+                fprintf(stderr, "Note: -pv/--pwritev is not available on this platform\n");
+            }
 #endif
             print_usage(argv[0]);
             return 1;
         }
+    }
+    
+    /* Ensure we have exactly 2 arguments left (size and filename) */
+    if (verbose) {
+        printf("[VERBOSE] After parsing flags: arg_offset=%d, argc=%d, remaining=%d\n", 
+               arg_offset, argc, argc - arg_offset);
+        printf("[VERBOSE] Expected 2 remaining args (size, filename), got %d\n", 
+               argc - arg_offset);
+    }
+    
+    if (arg_offset != argc - 2) {
+        fprintf(stderr, "Error: Expected <size> <filename> after options\n");
+        if (verbose) {
+            fprintf(stderr, "[VERBOSE] arg_offset=%d, argc=%d, needed argc-2=%d\n", 
+                    arg_offset, argc, argc - 2);
+        }
+        print_usage(argv[0]);
+        return 1;
     }
     
     size_str = argv[arg_offset];
