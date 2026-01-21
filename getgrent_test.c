@@ -1,20 +1,25 @@
 /*
  * getgrent_test.c
  *
- * AIX getgrent Test Program (No Root Required)
+ * AIX getgrent_r Test Program (No Root Required)
  *
- * Tests group database access with guarded buffers to detect overflow.
- * Run setup_test_groups.sh as root first to create test groups.
+ * Tests group database enumeration using AIX reentrant getgrent_r().
+ * Displays API tracing with return values, errno, and buffer sizes.
+ *
+ * AIX Reentrant Group Enumeration APIs:
+ *   int setgrent_r(FILE **grpfp);
+ *   int getgrent_r(struct group *grp, char *buffer, int buflen, FILE **grpfp);
+ *   void endgrent_r(FILE **grpfp);
  *
  * Compile on AIX:
  *   xlc_r -o getgrent_test getgrent_test.c
  *   gcc -D_THREAD_SAFE -o getgrent_test getgrent_test.c
  *
  * Usage:
- *   ./getgrent_test                    # Enumerate all groups
- *   ./getgrent_test -g <groupname>     # Lookup specific group
- *   ./getgrent_test -b <bufsize>       # Use specific buffer size
- *   ./getgrent_test -g ztest_grp -b 64 # Lookup with small buffer
+ *   ./getgrent_test              # Enumerate with default buffer (4096)
+ *   ./getgrent_test -b 256       # Enumerate with 256 byte buffer
+ *   ./getgrent_test -a           # Show all groups (not just test groups)
+ *   ./getgrent_test -h           # Show help
  */
 
 #define _THREAD_SAFE
@@ -27,86 +32,7 @@
 #include <sys/types.h>
 #include <grp.h>
 
-/*
- * AIX POSIX Reentrant APIs:
- *   int getgrnam_r(name, grp, buf, buflen, &result)
- *   int getgrgid_r(gid, grp, buf, buflen, &result)
- */
-
-#define GUARD_FILL      0x5A
-#define BUFFER_FILL     0xAA
-#define HEAD_GUARD_SIZE 64
-#define TAIL_GUARD_SIZE 256
-
-typedef struct {
-    size_t          user_size;
-    size_t          total_size;
-    unsigned char   *raw;
-    unsigned char   *head;
-    unsigned char   *buffer;
-    unsigned char   *tail;
-} guarded_buf_t;
-
-static guarded_buf_t *guarded_alloc(size_t size)
-{
-    guarded_buf_t *g = malloc(sizeof(guarded_buf_t));
-    if (!g) return NULL;
-
-    g->user_size = size;
-    g->total_size = HEAD_GUARD_SIZE + size + TAIL_GUARD_SIZE;
-    g->raw = malloc(g->total_size);
-    if (!g->raw) {
-        free(g);
-        return NULL;
-    }
-
-    g->head = g->raw;
-    g->buffer = g->raw + HEAD_GUARD_SIZE;
-    g->tail = g->buffer + size;
-
-    memset(g->head, GUARD_FILL, HEAD_GUARD_SIZE);
-    memset(g->buffer, BUFFER_FILL, size);
-    memset(g->tail, GUARD_FILL, TAIL_GUARD_SIZE);
-
-    return g;
-}
-
-static void guarded_free(guarded_buf_t *g)
-{
-    if (g) {
-        free(g->raw);
-        free(g);
-    }
-}
-
-static int guarded_check(guarded_buf_t *g, const char *context)
-{
-    int errors = 0;
-    size_t i;
-
-    for (i = 0; i < HEAD_GUARD_SIZE; i++) {
-        if (g->head[i] != GUARD_FILL) {
-            if (errors < 3)
-                fprintf(stderr, "[UNDERFLOW] %s: head[%zu]=0x%02X\n",
-                        context, i, g->head[i]);
-            errors++;
-        }
-    }
-
-    for (i = 0; i < TAIL_GUARD_SIZE; i++) {
-        if (g->tail[i] != GUARD_FILL) {
-            if (errors < 3)
-                fprintf(stderr, "[OVERFLOW] %s: tail[%zu]=0x%02X\n",
-                        context, i, g->tail[i]);
-            errors++;
-        }
-    }
-
-    if (errors > 3)
-        fprintf(stderr, "  ... %d more guard violations\n", errors - 3);
-
-    return errors;
-}
+#define DEFAULT_BUFLEN 4096
 
 static void print_group(const struct group *grp)
 {
@@ -132,243 +58,154 @@ static void print_group(const struct group *grp)
 }
 
 /*
- * Enumerate all groups using non-reentrant getgrent()
+ * Enumerate all groups using AIX getgrent_r()
  */
-static void enumerate_groups(void)
+static void enumerate_groups(int buflen, int show_all)
 {
-    struct group *grp;
+    struct group grp;
+    char *buffer;
+    FILE *grpfp = NULL;
+    int ret;
     int count = 0;
     int test_found = 0;
     int saved_errno;
 
-    printf("=== Enumerating All Groups ===\n\n");
+    printf("=== Enumerating Groups (AIX getgrent_r) ===\n\n");
+    printf("Buffer size: %d bytes\n\n", buflen);
 
-    printf("[CALL] setgrent()\n");
-    errno = 0;
-    setgrent();
-    saved_errno = errno;
-    if (saved_errno != 0) {
-        printf("[WARN] setgrent() set errno=%d (%s)\n", saved_errno, strerror(saved_errno));
-    }
-
-    printf("[CALL] getgrent() in loop...\n\n");
-    errno = 0;
-    while ((grp = getgrent()) != NULL) {
-        count++;
-
-        /* Show test groups (lowercase for AIX, uppercase for IBM i PASE) */
-        if (strncmp(grp->gr_name, "ztest_", 6) == 0 ||
-            strncmp(grp->gr_name, "ZTEST", 5) == 0) {
-            printf("Group #%d:\n", count);
-            print_group(grp);
-            printf("\n");
-            test_found = 1;
-        }
-    }
-    saved_errno = errno;
-
-    /* Check if loop ended due to error vs end-of-data */
-    printf("[INFO] getgrent() returned NULL after %d groups\n", count);
-    if (saved_errno != 0) {
-        fprintf(stderr, "[ERROR] getgrent failed: %s (errno=%d)\n",
-                strerror(saved_errno), saved_errno);
-    } else {
-        printf("[INFO] errno=0 (normal end of enumeration)\n");
-    }
-
-    printf("[CALL] endgrent()\n");
-    endgrent();
-
-    printf("\nTotal groups: %d\n", count);
-    if (!test_found) {
-        printf("\nNo test groups found (ztest_*/ZTEST*).\n");
-        printf("Run: setup_test_groups.sh setup\n");
-    }
-}
-
-/*
- * Lookup group by name with guarded buffer
- */
-static void lookup_group(const char *name, size_t bufsize)
-{
-    struct group grp;
-    struct group *result;
-    guarded_buf_t *g;
-    int ret;
-    int saved_errno;
-
-    printf("=== Lookup Group: %s ===\n", name);
-    printf("Buffer size: %zu bytes\n", bufsize);
-    printf("Guard regions: head=%d, tail=%d bytes\n\n",
-           HEAD_GUARD_SIZE, TAIL_GUARD_SIZE);
-
-    g = guarded_alloc(bufsize);
-    if (!g) {
+    /* Allocate buffer */
+    buffer = malloc(buflen);
+    if (buffer == NULL) {
         perror("malloc");
         return;
     }
 
-    printf("[CALL] getgrnam_r(\"%s\", &grp, buffer, %zu, &result)\n", name, bufsize);
+    /* setgrent_r() */
+    printf("[CALL] setgrent_r(&grpfp) where grpfp=%p\n", (void *)grpfp);
     errno = 0;
-    ret = getgrnam_r(name, &grp, (char *)g->buffer, bufsize, &result);
+    ret = setgrent_r(&grpfp);
     saved_errno = errno;
+    printf("[RESULT] return=%d, grpfp=%p, errno=%d", ret, (void *)grpfp, saved_errno);
+    if (saved_errno != 0) {
+        printf(" (%s)", strerror(saved_errno));
+    }
+    printf("\n\n");
 
-    printf("[RESULT] return=%d, result=%p, errno=%d\n", ret, (void *)result, saved_errno);
+    if (ret != 0) {
+        printf("[ERROR] setgrent_r failed\n");
+        free(buffer);
+        return;
+    }
 
-    if (ret == -1) {
-        printf("[ERROR] getgrnam_r returned -1: %s (errno=%d)\n",
-               strerror(saved_errno), saved_errno);
-    } else if (ret == ERANGE) {
-        printf("[INFO] ERANGE - buffer too small\n");
-    } else if (ret != 0) {
-        printf("[ERROR] getgrnam_r failed: %s (ret=%d, errno=%d)\n",
-               strerror(ret), ret, saved_errno);
+    /* getgrent_r() loop */
+    printf("[CALL] getgrent_r(&grp, buffer, %d, &grpfp) in loop...\n\n", buflen);
+
+    while (1) {
+        errno = 0;
+        ret = getgrent_r(&grp, buffer, buflen, &grpfp);
+        saved_errno = errno;
+
+        if (ret != 0) {
+            printf("[CALL] getgrent_r(&grp, buffer, %d, &grpfp)\n", buflen);
+            printf("[RESULT] return=%d, errno=%d", ret, saved_errno);
+            if (saved_errno != 0) {
+                printf(" (%s)", strerror(saved_errno));
+            }
+            if (saved_errno == ERANGE) {
+                printf(" - buffer too small!");
+            }
+            printf("\n");
+            break;
+        }
+
+        count++;
+
+        /* Check if test group (lowercase for AIX, uppercase for IBM i PASE) */
+        int is_test = (strncmp(grp.gr_name, "ztest_", 6) == 0 ||
+                       strncmp(grp.gr_name, "ZTEST", 5) == 0);
+
+        if (is_test) {
+            test_found = 1;
+        }
+
+        if (show_all || is_test) {
+            printf("[CALL] getgrent_r(&grp, buffer, %d, &grpfp)\n", buflen);
+            printf("[RESULT] return=%d, errno=%d\n", ret, saved_errno);
+            printf("Group #%d:\n", count);
+            print_group(&grp);
+            printf("\n");
+        }
+    }
+
+    /* endgrent_r() */
+    printf("\n[CALL] endgrent_r(&grpfp) where grpfp=%p\n", (void *)grpfp);
+    errno = 0;
+    endgrent_r(&grpfp);
+    saved_errno = errno;
+    printf("[RESULT] grpfp=%p, errno=%d", (void *)grpfp, saved_errno);
+    if (saved_errno != 0) {
+        printf(" (%s)", strerror(saved_errno));
     }
     printf("\n");
 
-    /* Check guard regions */
-    if (guarded_check(g, name) == 0) {
-        printf("[OK] Guard regions intact\n\n");
-    } else {
-        printf("[CRITICAL] Buffer overflow detected!\n\n");
+    /* Summary */
+    printf("\n=== Summary ===\n");
+    printf("Buffer size: %d bytes\n", buflen);
+    printf("Total groups enumerated: %d\n", count);
+
+    if (!show_all) {
+        if (test_found) {
+            printf("Test groups (ztest_*/ZTEST*) found.\n");
+        } else {
+            printf("No test groups found (ztest_*/ZTEST*).\n");
+            printf("Run: setup_test_groups.sh setup\n");
+        }
     }
 
-    if (ret == 0 && result) {
-        print_group(&grp);
-    } else if (ret == ERANGE) {
-        printf("Try larger buffer: -b %zu\n", bufsize * 2);
-    } else if (ret == 0 && !result) {
-        printf("Group '%s' not found.\n", name);
-    }
-
-    guarded_free(g);
-}
-
-/*
- * Progressive buffer sizing test
- */
-static void test_progressive(const char *name)
-{
-    struct group grp;
-    struct group *result;
-    guarded_buf_t *g = NULL;
-    int ret;
-    int saved_errno;
-    size_t sizes[] = {32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 0};
-    int i;
-
-    printf("=== Progressive Buffer Test: %s ===\n\n", name);
-
-    for (i = 0; sizes[i] != 0; i++) {
-        if (g) guarded_free(g);
-        g = guarded_alloc(sizes[i]);
-        if (!g) {
-            perror("malloc");
-            return;
-        }
-
-        printf("[CALL] getgrnam_r(\"%s\", &grp, buffer, %zu, &result)\n", name, sizes[i]);
-        errno = 0;
-        ret = getgrnam_r(name, &grp, (char *)g->buffer, sizes[i], &result);
-        saved_errno = errno;
-
-        printf("  %5zu bytes: ", sizes[i]);
-
-        if (ret == -1) {
-            printf("error -1 (%s, errno=%d)\n", strerror(saved_errno), saved_errno);
-            if (guarded_check(g, "progressive") != 0)
-                printf("         [OVERFLOW detected!]\n");
-            break;
-        }
-
-        if (ret == ERANGE) {
-            printf("ERANGE (errno=%d)", saved_errno);
-            if (guarded_check(g, "progressive") != 0)
-                printf(" [OVERFLOW!]");
-            printf("\n");
-            continue;
-        }
-
-        if (ret != 0) {
-            printf("error %d (%s, errno=%d)\n", ret, strerror(ret), saved_errno);
-            if (guarded_check(g, "progressive") != 0)
-                printf("         [OVERFLOW detected!]\n");
-            break;
-        }
-
-        if (!result) {
-            printf("not found (ret=0, result=NULL, errno=%d)\n", saved_errno);
-            break;
-        }
-
-        /* Success */
-        int members = 0;
-        if (grp.gr_mem) {
-            char **m;
-            for (m = grp.gr_mem; *m; m++) members++;
-        }
-        printf("OK - %d members", members);
-        if (guarded_check(g, "progressive") != 0)
-            printf(" [OVERFLOW!]");
-        printf("\n");
-        break;
-    }
-
-    if (sizes[i] == 0)
-        printf("\nFailed: buffer too small even at 8192 bytes\n");
-
-    if (g) guarded_free(g);
+    free(buffer);
 }
 
 static void usage(const char *prog)
 {
     printf("Usage: %s [options]\n\n", prog);
+    printf("Enumerate groups using AIX getgrent_r() with API tracing.\n\n");
     printf("Options:\n");
-    printf("  -g <name>    Lookup specific group\n");
-    printf("  -b <size>    Buffer size (default: 4096)\n");
-    printf("  -p <name>    Progressive buffer test for group\n");
-    printf("  -e           Enumerate all groups\n");
+    printf("  -b <size>    Buffer size in bytes (default: %d)\n", DEFAULT_BUFLEN);
+    printf("  -a           Show all groups (default: only test groups)\n");
     printf("  -h           Show this help\n");
     printf("\nExamples:\n");
-    printf("  %s -e                    Enumerate all groups\n", prog);
-    printf("  %s -g root               Lookup root group\n", prog);
-    printf("  %s -g ztest_grp -b 64    Test with small buffer\n", prog);
-    printf("  %s -p ztest_grp          Progressive buffer test\n", prog);
-    printf("\nSetup test groups first:\n");
-    printf("  # as root\n");
+    printf("  %s                 Enumerate with %d byte buffer\n", prog, DEFAULT_BUFLEN);
+    printf("  %s -b 256          Enumerate with 256 byte buffer\n", prog);
+    printf("  %s -b 64           Small buffer (may trigger ERANGE)\n", prog);
+    printf("  %s -a              Show all groups\n", prog);
+    printf("\nAIX APIs used:\n");
+    printf("  int setgrent_r(FILE **grpfp)\n");
+    printf("  int getgrent_r(struct group *grp, char *buf, int buflen, FILE **grpfp)\n");
+    printf("  void endgrent_r(FILE **grpfp)\n");
+    printf("\nSetup test groups first (requires root):\n");
     printf("  ./setup_test_groups.sh setup 50\n");
 }
 
 int main(int argc, char *argv[])
 {
     int opt;
-    char *groupname = NULL;
-    size_t bufsize = 4096;
-    int do_enumerate = 0;
-    int do_progressive = 0;
+    int buflen = DEFAULT_BUFLEN;
+    int show_all = 0;
 
-    printf("AIX getgrent Test\n");
-    printf("=================\n\n");
+    printf("AIX getgrent_r Test\n");
+    printf("===================\n\n");
 
-    if (argc == 1) {
-        do_enumerate = 1;
-    }
-
-    while ((opt = getopt(argc, argv, "g:b:p:eh")) != -1) {
+    while ((opt = getopt(argc, argv, "b:ah")) != -1) {
         switch (opt) {
-        case 'g':
-            groupname = optarg;
-            break;
         case 'b':
-            bufsize = (size_t)atoi(optarg);
-            if (bufsize < 32) bufsize = 32;
+            buflen = atoi(optarg);
+            if (buflen < 32) {
+                fprintf(stderr, "Buffer size too small, using 32\n");
+                buflen = 32;
+            }
             break;
-        case 'p':
-            groupname = optarg;
-            do_progressive = 1;
-            break;
-        case 'e':
-            do_enumerate = 1;
+        case 'a':
+            show_all = 1;
             break;
         case 'h':
         default:
@@ -377,16 +214,7 @@ int main(int argc, char *argv[])
         }
     }
 
-    if (do_enumerate) {
-        enumerate_groups();
-    } else if (do_progressive && groupname) {
-        test_progressive(groupname);
-    } else if (groupname) {
-        lookup_group(groupname, bufsize);
-    } else {
-        usage(argv[0]);
-        return 1;
-    }
+    enumerate_groups(buflen, show_all);
 
     return 0;
 }
