@@ -4,7 +4,14 @@
  * AIX getgrent_r Test Program (No Root Required)
  *
  * Tests group database enumeration using AIX reentrant getgrent_r().
- * Displays API tracing with return values, errno, and buffer sizes.
+ * Features:
+ *   - API tracing (strace-style) with return values and errno
+ *   - Guarded buffers to detect buffer overflow/underflow
+ *   - Configurable buffer size via -b option
+ *
+ * Buffer Layout:
+ *   [HEAD_GUARD 64 bytes][USER_BUFFER N bytes][TAIL_GUARD 256 bytes]
+ *   Guard regions filled with 0x5A, checked after each getgrent_r() call.
  *
  * AIX Reentrant Group Enumeration APIs:
  *   int setgrent_r(FILE **grpfp);
@@ -17,7 +24,7 @@
  *
  * Usage:
  *   ./getgrent_test              # Enumerate with default buffer (4096)
- *   ./getgrent_test -b 256       # Enumerate with 256 byte buffer
+ *   ./getgrent_test -b 2048      # Enumerate with 2048 byte buffer
  *   ./getgrent_test -a           # Show all groups (not just test groups)
  *   ./getgrent_test -h           # Show help
  */
@@ -33,6 +40,85 @@
 #include <grp.h>
 
 #define DEFAULT_BUFLEN 4096
+
+/* Guard region settings for overflow detection */
+#define GUARD_FILL      0x5A
+#define HEAD_GUARD_SIZE 64
+#define TAIL_GUARD_SIZE 256
+
+typedef struct {
+    size_t          user_size;      /* Size requested by user */
+    size_t          total_size;     /* Total allocated size */
+    unsigned char   *raw;           /* Raw allocation */
+    unsigned char   *head_guard;    /* Head guard region */
+    unsigned char   *buffer;        /* User buffer (passed to getgrent_r) */
+    unsigned char   *tail_guard;    /* Tail guard region */
+} guarded_buf_t;
+
+static guarded_buf_t *guarded_alloc(size_t size)
+{
+    guarded_buf_t *g = malloc(sizeof(guarded_buf_t));
+    if (!g) return NULL;
+
+    g->user_size = size;
+    g->total_size = HEAD_GUARD_SIZE + size + TAIL_GUARD_SIZE;
+    g->raw = malloc(g->total_size);
+    if (!g->raw) {
+        free(g);
+        return NULL;
+    }
+
+    g->head_guard = g->raw;
+    g->buffer = g->raw + HEAD_GUARD_SIZE;
+    g->tail_guard = g->buffer + size;
+
+    /* Fill guard regions with known pattern */
+    memset(g->head_guard, GUARD_FILL, HEAD_GUARD_SIZE);
+    memset(g->buffer, 0, size);  /* Zero the user buffer */
+    memset(g->tail_guard, GUARD_FILL, TAIL_GUARD_SIZE);
+
+    return g;
+}
+
+static void guarded_free(guarded_buf_t *g)
+{
+    if (g) {
+        free(g->raw);
+        free(g);
+    }
+}
+
+/* Returns number of guard violations (0 = no overflow) */
+static int guarded_check(guarded_buf_t *g, const char *context)
+{
+    int errors = 0;
+    size_t i;
+
+    /* Check head guard (underflow detection) */
+    for (i = 0; i < HEAD_GUARD_SIZE; i++) {
+        if (g->head_guard[i] != GUARD_FILL) {
+            if (errors < 3)
+                fprintf(stderr, "[UNDERFLOW] %s: head_guard[%zu]=0x%02X (expected 0x%02X)\n",
+                        context, i, g->head_guard[i], GUARD_FILL);
+            errors++;
+        }
+    }
+
+    /* Check tail guard (overflow detection) */
+    for (i = 0; i < TAIL_GUARD_SIZE; i++) {
+        if (g->tail_guard[i] != GUARD_FILL) {
+            if (errors < 3)
+                fprintf(stderr, "[OVERFLOW] %s: tail_guard[%zu]=0x%02X (expected 0x%02X)\n",
+                        context, i, g->tail_guard[i], GUARD_FILL);
+            errors++;
+        }
+    }
+
+    if (errors > 3)
+        fprintf(stderr, "  ... %d more guard violations\n", errors - 3);
+
+    return errors;
+}
 
 static void print_group(const struct group *grp)
 {
@@ -63,19 +149,22 @@ static void print_group(const struct group *grp)
 static void enumerate_groups(int buflen, int show_all)
 {
     struct group grp;
-    char *buffer;
+    guarded_buf_t *gbuf;
     FILE *grpfp = NULL;
     int ret;
     int count = 0;
     int test_found = 0;
     int saved_errno;
+    int overflow_detected = 0;
 
     printf("=== Enumerating Groups (AIX getgrent_r) ===\n\n");
-    printf("Buffer size: %d bytes\n\n", buflen);
+    printf("Buffer size: %d bytes\n", buflen);
+    printf("Guard regions: head=%d bytes, tail=%d bytes\n", HEAD_GUARD_SIZE, TAIL_GUARD_SIZE);
+    printf("Total allocated: %d bytes\n\n", buflen + HEAD_GUARD_SIZE + TAIL_GUARD_SIZE);
 
-    /* Allocate buffer */
-    buffer = malloc(buflen);
-    if (buffer == NULL) {
+    /* Allocate guarded buffer */
+    gbuf = guarded_alloc(buflen);
+    if (gbuf == NULL) {
         perror("malloc");
         return;
     }
@@ -93,7 +182,7 @@ static void enumerate_groups(int buflen, int show_all)
 
     if (ret != 0) {
         printf("[ERROR] setgrent_r failed\n");
-        free(buffer);
+        guarded_free(gbuf);
         return;
     }
 
@@ -102,8 +191,14 @@ static void enumerate_groups(int buflen, int show_all)
 
     while (1) {
         errno = 0;
-        ret = getgrent_r(&grp, buffer, buflen, &grpfp);
+        ret = getgrent_r(&grp, (char *)gbuf->buffer, buflen, &grpfp);
         saved_errno = errno;
+
+        /* Check for buffer overflow after each call */
+        if (guarded_check(gbuf, grp.gr_name ? grp.gr_name : "(null)") != 0) {
+            overflow_detected = 1;
+            printf("[CRITICAL] Buffer overflow detected!\n");
+        }
 
         if (ret != 0) {
             printf("[CALL] getgrent_r(&grp, buffer, %d, &grpfp)\n", buflen);
@@ -151,7 +246,15 @@ static void enumerate_groups(int buflen, int show_all)
     /* Summary */
     printf("\n=== Summary ===\n");
     printf("Buffer size: %d bytes\n", buflen);
+    printf("Guard regions: head=%d, tail=%d bytes\n", HEAD_GUARD_SIZE, TAIL_GUARD_SIZE);
     printf("Total groups enumerated: %d\n", count);
+
+    if (overflow_detected) {
+        printf("\n[CRITICAL] BUFFER OVERFLOW WAS DETECTED!\n");
+        printf("The getgrent_r() function wrote beyond the %d byte buffer.\n", buflen);
+    } else {
+        printf("\n[OK] No buffer overflow detected - guard regions intact.\n");
+    }
 
     if (!show_all) {
         if (test_found) {
@@ -162,22 +265,26 @@ static void enumerate_groups(int buflen, int show_all)
         }
     }
 
-    free(buffer);
+    guarded_free(gbuf);
 }
 
 static void usage(const char *prog)
 {
     printf("Usage: %s [options]\n\n", prog);
-    printf("Enumerate groups using AIX getgrent_r() with API tracing.\n\n");
+    printf("Enumerate groups using AIX getgrent_r() with API tracing.\n");
+    printf("Uses guarded buffers to detect buffer overflow.\n\n");
     printf("Options:\n");
     printf("  -b <size>    Buffer size in bytes (default: %d)\n", DEFAULT_BUFLEN);
     printf("  -a           Show all groups (default: only test groups)\n");
     printf("  -h           Show this help\n");
     printf("\nExamples:\n");
     printf("  %s                 Enumerate with %d byte buffer\n", prog, DEFAULT_BUFLEN);
-    printf("  %s -b 256          Enumerate with 256 byte buffer\n", prog);
-    printf("  %s -b 64           Small buffer (may trigger ERANGE)\n", prog);
+    printf("  %s -b 2048         Enumerate with 2048 byte buffer\n", prog);
+    printf("  %s -b 256          Smaller buffer (test overflow detection)\n", prog);
     printf("  %s -a              Show all groups\n", prog);
+    printf("\nGuard regions:\n");
+    printf("  Head guard: %d bytes before buffer (detect underflow)\n", HEAD_GUARD_SIZE);
+    printf("  Tail guard: %d bytes after buffer (detect overflow)\n", TAIL_GUARD_SIZE);
     printf("\nAIX APIs used:\n");
     printf("  int setgrent_r(FILE **grpfp)\n");
     printf("  int getgrent_r(struct group *grp, char *buf, int buflen, FILE **grpfp)\n");
