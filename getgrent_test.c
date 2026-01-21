@@ -139,26 +139,49 @@ static void enumerate_groups(void)
     struct group *grp;
     int count = 0;
     int test_found = 0;
+    int saved_errno;
 
     printf("=== Enumerating All Groups ===\n\n");
 
+    printf("[CALL] setgrent()\n");
+    errno = 0;
     setgrent();
+    saved_errno = errno;
+    if (saved_errno != 0) {
+        printf("[WARN] setgrent() set errno=%d (%s)\n", saved_errno, strerror(saved_errno));
+    }
+
+    printf("[CALL] getgrent() in loop...\n\n");
+    errno = 0;
     while ((grp = getgrent()) != NULL) {
         count++;
 
-        /* Show test groups */
-        if (strncmp(grp->gr_name, "ztest_", 6) == 0) {
+        /* Show test groups (lowercase for AIX, uppercase for IBM i PASE) */
+        if (strncmp(grp->gr_name, "ztest_", 6) == 0 ||
+            strncmp(grp->gr_name, "ZTEST", 5) == 0) {
             printf("Group #%d:\n", count);
             print_group(grp);
             printf("\n");
             test_found = 1;
         }
     }
+    saved_errno = errno;
+
+    /* Check if loop ended due to error vs end-of-data */
+    printf("[INFO] getgrent() returned NULL after %d groups\n", count);
+    if (saved_errno != 0) {
+        fprintf(stderr, "[ERROR] getgrent failed: %s (errno=%d)\n",
+                strerror(saved_errno), saved_errno);
+    } else {
+        printf("[INFO] errno=0 (normal end of enumeration)\n");
+    }
+
+    printf("[CALL] endgrent()\n");
     endgrent();
 
-    printf("Total groups: %d\n", count);
+    printf("\nTotal groups: %d\n", count);
     if (!test_found) {
-        printf("\nNo test groups found (ztest_*).\n");
+        printf("\nNo test groups found (ztest_*/ZTEST*).\n");
         printf("Run: setup_test_groups.sh setup\n");
     }
 }
@@ -172,6 +195,7 @@ static void lookup_group(const char *name, size_t bufsize)
     struct group *result;
     guarded_buf_t *g;
     int ret;
+    int saved_errno;
 
     printf("=== Lookup Group: %s ===\n", name);
     printf("Buffer size: %zu bytes\n", bufsize);
@@ -184,14 +208,23 @@ static void lookup_group(const char *name, size_t bufsize)
         return;
     }
 
+    printf("[CALL] getgrnam_r(\"%s\", &grp, buffer, %zu, &result)\n", name, bufsize);
+    errno = 0;
     ret = getgrnam_r(name, &grp, (char *)g->buffer, bufsize, &result);
+    saved_errno = errno;
 
-    printf("Return: %d", ret);
-    if (ret == ERANGE) printf(" (ERANGE - buffer too small)");
-    else if (ret != 0) printf(" (%s)", strerror(ret));
+    printf("[RESULT] return=%d, result=%p, errno=%d\n", ret, (void *)result, saved_errno);
+
+    if (ret == -1) {
+        printf("[ERROR] getgrnam_r returned -1: %s (errno=%d)\n",
+               strerror(saved_errno), saved_errno);
+    } else if (ret == ERANGE) {
+        printf("[INFO] ERANGE - buffer too small\n");
+    } else if (ret != 0) {
+        printf("[ERROR] getgrnam_r failed: %s (ret=%d, errno=%d)\n",
+               strerror(ret), ret, saved_errno);
+    }
     printf("\n");
-
-    printf("Result: %s\n\n", result ? "found" : "NULL");
 
     /* Check guard regions */
     if (guarded_check(g, name) == 0) {
@@ -220,6 +253,7 @@ static void test_progressive(const char *name)
     struct group *result;
     guarded_buf_t *g = NULL;
     int ret;
+    int saved_errno;
     size_t sizes[] = {32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 0};
     int i;
 
@@ -233,12 +267,22 @@ static void test_progressive(const char *name)
             return;
         }
 
+        printf("[CALL] getgrnam_r(\"%s\", &grp, buffer, %zu, &result)\n", name, sizes[i]);
+        errno = 0;
         ret = getgrnam_r(name, &grp, (char *)g->buffer, sizes[i], &result);
+        saved_errno = errno;
 
         printf("  %5zu bytes: ", sizes[i]);
 
+        if (ret == -1) {
+            printf("error -1 (%s, errno=%d)\n", strerror(saved_errno), saved_errno);
+            if (guarded_check(g, "progressive") != 0)
+                printf("         [OVERFLOW detected!]\n");
+            break;
+        }
+
         if (ret == ERANGE) {
-            printf("ERANGE");
+            printf("ERANGE (errno=%d)", saved_errno);
             if (guarded_check(g, "progressive") != 0)
                 printf(" [OVERFLOW!]");
             printf("\n");
@@ -246,12 +290,14 @@ static void test_progressive(const char *name)
         }
 
         if (ret != 0) {
-            printf("error %d\n", ret);
+            printf("error %d (%s, errno=%d)\n", ret, strerror(ret), saved_errno);
+            if (guarded_check(g, "progressive") != 0)
+                printf("         [OVERFLOW detected!]\n");
             break;
         }
 
         if (!result) {
-            printf("not found\n");
+            printf("not found (ret=0, result=NULL, errno=%d)\n", saved_errno);
             break;
         }
 
