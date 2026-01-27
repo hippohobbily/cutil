@@ -1,15 +1,16 @@
 /*
  * getgrent_test.c
  *
- * AIX getgrent_r Test Program (No Root Required)
+ * AIX getgrent/getgrent_r Test Program (No Root Required)
  *
- * Tests group database enumeration using AIX reentrant getgrent_r().
+ * Tests group database enumeration using AIX getgrent_r() or getgrent().
  * Features:
  *   - API tracing (strace-style) with return values and errno
- *   - Guarded buffers to detect buffer overflow/underflow
+ *   - Guarded buffers to detect buffer overflow/underflow (reentrant mode)
  *   - Configurable buffer size via -b option
+ *   - Option to use non-reentrant getgrent() via -n option
  *
- * Buffer Layout:
+ * Buffer Layout (reentrant mode only):
  *   [HEAD_GUARD 64 bytes][USER_BUFFER N bytes][TAIL_GUARD 256 bytes]
  *   Guard regions filled with 0x5A, checked after each getgrent_r() call.
  *
@@ -18,6 +19,11 @@
  *   int getgrent_r(struct group *grp, char *buffer, int buflen, FILE **grpfp);
  *   void endgrent_r(FILE **grpfp);
  *
+ * AIX Non-Reentrant Group Enumeration APIs:
+ *   void setgrent(void);
+ *   struct group *getgrent(void);
+ *   void endgrent(void);
+ *
  * Compile on AIX:
  *   xlc_r -o getgrent_test getgrent_test.c
  *   gcc -D_THREAD_SAFE -o getgrent_test getgrent_test.c
@@ -25,6 +31,7 @@
  * Usage:
  *   ./getgrent_test              # Enumerate with default buffer (4096)
  *   ./getgrent_test -b 2048      # Enumerate with 2048 byte buffer
+ *   ./getgrent_test -n           # Use non-reentrant getgrent()
  *   ./getgrent_test -a           # Show all groups (not just test groups)
  *   ./getgrent_test -h           # Show help
  */
@@ -144,9 +151,98 @@ static void print_group(const struct group *grp)
 }
 
 /*
+ * Enumerate all groups using non-reentrant getgrent()
+ * Uses static internal buffer - not thread-safe but simpler.
+ */
+static void enumerate_groups_nonreentrant(int show_all)
+{
+    struct group *grp;
+    int count = 0;
+    int test_found = 0;
+    int saved_errno;
+
+    printf("=== Enumerating Groups (non-reentrant getgrent) ===\n\n");
+    printf("Note: getgrent() uses static storage, no user buffer needed.\n");
+    printf("      Data may be overwritten by subsequent calls.\n\n");
+
+    /* setgrent() */
+    printf("[CALL] setgrent()\n");
+    errno = 0;
+    setgrent();
+    saved_errno = errno;
+    printf("[RESULT] errno=%d", saved_errno);
+    if (saved_errno != 0) {
+        printf(" (%s)", strerror(saved_errno));
+    }
+    printf("\n\n");
+
+    /* getgrent() loop */
+    printf("[CALL] getgrent() in loop...\n\n");
+
+    while (1) {
+        errno = 0;
+        grp = getgrent();
+        saved_errno = errno;
+
+        if (grp == NULL) {
+            printf("[CALL] getgrent()\n");
+            printf("[RESULT] return=NULL, errno=%d", saved_errno);
+            if (saved_errno != 0) {
+                printf(" (%s)", strerror(saved_errno));
+            }
+            printf("\n");
+            break;
+        }
+
+        count++;
+
+        /* Check if test group */
+        int is_test = (strncmp(grp->gr_name, "ztest_", 6) == 0 ||
+                       strncmp(grp->gr_name, "ZTEST", 5) == 0);
+
+        if (is_test) {
+            test_found = 1;
+        }
+
+        if (show_all || is_test) {
+            printf("[CALL] getgrent()\n");
+            printf("[RESULT] return=%p, errno=%d\n", (void *)grp, saved_errno);
+            printf("Group #%d:\n", count);
+            print_group(grp);
+            printf("\n");
+        }
+    }
+
+    /* endgrent() */
+    printf("\n[CALL] endgrent()\n");
+    errno = 0;
+    endgrent();
+    saved_errno = errno;
+    printf("[RESULT] errno=%d", saved_errno);
+    if (saved_errno != 0) {
+        printf(" (%s)", strerror(saved_errno));
+    }
+    printf("\n");
+
+    /* Summary */
+    printf("\n=== Summary ===\n");
+    printf("API mode: non-reentrant (getgrent)\n");
+    printf("Total groups enumerated: %d\n", count);
+
+    if (!show_all) {
+        if (test_found) {
+            printf("Test groups (ztest_*/ZTEST*) found.\n");
+        } else {
+            printf("No test groups found (ztest_*/ZTEST*).\n");
+            printf("Run: setup_test_groups.sh setup\n");
+        }
+    }
+}
+
+/*
  * Enumerate all groups using AIX getgrent_r()
  */
-static void enumerate_groups(int buflen, int show_all)
+static void enumerate_groups_reentrant(int buflen, int show_all)
 {
     struct group grp;
     guarded_buf_t *gbuf;
@@ -271,24 +367,31 @@ static void enumerate_groups(int buflen, int show_all)
 static void usage(const char *prog)
 {
     printf("Usage: %s [options]\n\n", prog);
-    printf("Enumerate groups using AIX getgrent_r() with API tracing.\n");
-    printf("Uses guarded buffers to detect buffer overflow.\n\n");
+    printf("Enumerate groups using AIX getgrent_r() or getgrent() with API tracing.\n");
+    printf("Uses guarded buffers to detect buffer overflow (reentrant mode).\n\n");
     printf("Options:\n");
     printf("  -b <size>    Buffer size in bytes (default: %d)\n", DEFAULT_BUFLEN);
+    printf("  -n           Use non-reentrant getgrent() instead of getgrent_r()\n");
     printf("  -a           Show all groups (default: only test groups)\n");
     printf("  -h           Show this help\n");
     printf("\nExamples:\n");
-    printf("  %s                 Enumerate with %d byte buffer\n", prog, DEFAULT_BUFLEN);
+    printf("  %s                 Enumerate with %d byte buffer (reentrant)\n", prog, DEFAULT_BUFLEN);
     printf("  %s -b 2048         Enumerate with 2048 byte buffer\n", prog);
     printf("  %s -b 256          Smaller buffer (test overflow detection)\n", prog);
+    printf("  %s -n              Use non-reentrant getgrent()\n", prog);
+    printf("  %s -n -a           Non-reentrant, show all groups\n", prog);
     printf("  %s -a              Show all groups\n", prog);
-    printf("\nGuard regions:\n");
+    printf("\nGuard regions (reentrant mode only):\n");
     printf("  Head guard: %d bytes before buffer (detect underflow)\n", HEAD_GUARD_SIZE);
     printf("  Tail guard: %d bytes after buffer (detect overflow)\n", TAIL_GUARD_SIZE);
-    printf("\nAIX APIs used:\n");
+    printf("\nAIX Reentrant APIs (-b mode, default):\n");
     printf("  int setgrent_r(FILE **grpfp)\n");
     printf("  int getgrent_r(struct group *grp, char *buf, int buflen, FILE **grpfp)\n");
     printf("  void endgrent_r(FILE **grpfp)\n");
+    printf("\nAIX Non-Reentrant APIs (-n mode):\n");
+    printf("  void setgrent(void)\n");
+    printf("  struct group *getgrent(void)\n");
+    printf("  void endgrent(void)\n");
     printf("\nSetup test groups first (requires root):\n");
     printf("  ./setup_test_groups.sh setup 50\n");
 }
@@ -298,11 +401,12 @@ int main(int argc, char *argv[])
     int opt;
     int buflen = DEFAULT_BUFLEN;
     int show_all = 0;
+    int use_nonreentrant = 0;
 
-    printf("AIX getgrent_r Test\n");
-    printf("===================\n\n");
+    printf("AIX getgrent Test\n");
+    printf("=================\n\n");
 
-    while ((opt = getopt(argc, argv, "b:ah")) != -1) {
+    while ((opt = getopt(argc, argv, "b:nah")) != -1) {
         switch (opt) {
         case 'b':
             buflen = atoi(optarg);
@@ -310,6 +414,9 @@ int main(int argc, char *argv[])
                 fprintf(stderr, "Buffer size too small, using 32\n");
                 buflen = 32;
             }
+            break;
+        case 'n':
+            use_nonreentrant = 1;
             break;
         case 'a':
             show_all = 1;
@@ -321,7 +428,11 @@ int main(int argc, char *argv[])
         }
     }
 
-    enumerate_groups(buflen, show_all);
+    if (use_nonreentrant) {
+        enumerate_groups_nonreentrant(show_all);
+    } else {
+        enumerate_groups_reentrant(buflen, show_all);
+    }
 
     return 0;
 }
