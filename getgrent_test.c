@@ -167,14 +167,8 @@ static void enumerate_groups_nonreentrant(int show_all)
 
     /* setgrent() */
     printf("[CALL] setgrent()\n");
-    errno = 0;
     setgrent();
-    saved_errno = errno;
-    printf("[RESULT] errno=%d", saved_errno);
-    if (saved_errno != 0) {
-        printf(" (%s)", strerror(saved_errno));
-    }
-    printf("\n\n");
+    printf("[RESULT] OK (void function)\n\n");
 
     /* getgrent() loop */
     printf("[CALL] getgrent() in loop...\n\n");
@@ -206,7 +200,7 @@ static void enumerate_groups_nonreentrant(int show_all)
 
         if (show_all || is_test) {
             printf("[CALL] getgrent()\n");
-            printf("[RESULT] return=%p, errno=%d\n", (void *)grp, saved_errno);
+            printf("[RESULT] return=%p (success)\n", (void *)grp);
             printf("Group #%d:\n", count);
             print_group(grp);
             printf("\n");
@@ -215,14 +209,8 @@ static void enumerate_groups_nonreentrant(int show_all)
 
     /* endgrent() */
     printf("\n[CALL] endgrent()\n");
-    errno = 0;
     endgrent();
-    saved_errno = errno;
-    printf("[RESULT] errno=%d", saved_errno);
-    if (saved_errno != 0) {
-        printf(" (%s)", strerror(saved_errno));
-    }
-    printf("\n");
+    printf("[RESULT] OK (void function)\n");
 
     /* Summary */
     printf("\n=== Summary ===\n");
@@ -270,17 +258,14 @@ static void enumerate_groups_reentrant(int buflen, int show_all)
     errno = 0;
     ret = setgrent_r(&grpfp);
     saved_errno = errno;
-    printf("[RESULT] return=%d, grpfp=%p, errno=%d", ret, (void *)grpfp, saved_errno);
-    if (saved_errno != 0) {
-        printf(" (%s)", strerror(saved_errno));
-    }
-    printf("\n\n");
-
     if (ret != 0) {
+        printf("[RESULT] return=%d, grpfp=%p, errno=%d (%s)\n",
+               ret, (void *)grpfp, saved_errno, strerror(saved_errno));
         printf("[ERROR] setgrent_r failed\n");
         guarded_free(gbuf);
         return;
     }
+    printf("[RESULT] return=0, grpfp=%p (success)\n\n", (void *)grpfp);
 
     /* getgrent_r() loop */
     printf("[CALL] getgrent_r(&grp, buffer, %d, &grpfp) in loop...\n\n", buflen);
@@ -321,7 +306,7 @@ static void enumerate_groups_reentrant(int buflen, int show_all)
 
         if (show_all || is_test) {
             printf("[CALL] getgrent_r(&grp, buffer, %d, &grpfp)\n", buflen);
-            printf("[RESULT] return=%d, errno=%d\n", ret, saved_errno);
+            printf("[RESULT] return=0 (success)\n");
             printf("Group #%d:\n", count);
             print_group(&grp);
             printf("\n");
@@ -330,14 +315,8 @@ static void enumerate_groups_reentrant(int buflen, int show_all)
 
     /* endgrent_r() */
     printf("\n[CALL] endgrent_r(&grpfp) where grpfp=%p\n", (void *)grpfp);
-    errno = 0;
     endgrent_r(&grpfp);
-    saved_errno = errno;
-    printf("[RESULT] grpfp=%p, errno=%d", (void *)grpfp, saved_errno);
-    if (saved_errno != 0) {
-        printf(" (%s)", strerror(saved_errno));
-    }
-    printf("\n");
+    printf("[RESULT] OK (void function)\n");
 
     /* Summary */
     printf("\n=== Summary ===\n");
