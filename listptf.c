@@ -15,6 +15,16 @@
  *   ./listptf 5770SS1             # List PTFs for product
  *   ./listptf -o /tmp/out.txt     # Specify output file
  *   ./listptf -s                  # Summary only
+ *   ./listptf -v                  # Verbose (show SQL commands)
+ *
+ * CL COMMANDS USED:
+ *   RUNSQLSTM SRCSTMF('<file>') COMMIT(*NONE) OUTPUT(*PRINT)
+ *
+ * SQL EXECUTION METHOD:
+ *   /QOpenSys/usr/bin/qsh -c "db2 -t -f '<file>'"
+ *
+ * SQL TABLE:
+ *   QSYS2.PTF_INFO - PTF metadata and status
  *
  */
 
@@ -53,6 +63,26 @@ static int  g_verbose = 0;
 static int  g_summary = 0;
 
 /*-------------------------------------------------------------------*/
+/* Logging macros                                                     */
+/*-------------------------------------------------------------------*/
+
+#define LOG_INFO(fmt, ...)  printf("[INFO] " fmt "\n", ##__VA_ARGS__)
+#define LOG_ERROR(fmt, ...) fprintf(stderr, "[ERROR] " fmt "\n", ##__VA_ARGS__)
+#define LOG_WARN(fmt, ...)  printf("[WARN] " fmt "\n", ##__VA_ARGS__)
+
+#define LOG_DEBUG(fmt, ...) do { \
+    if (g_verbose) printf("[DEBUG] " fmt "\n", ##__VA_ARGS__); \
+} while(0)
+
+#define LOG_CMD(fmt, ...) do { \
+    if (g_verbose) printf("[CMD] " fmt "\n", ##__VA_ARGS__); \
+} while(0)
+
+#define LOG_SQL(fmt, ...) do { \
+    if (g_verbose) printf("[SQL] " fmt "\n", ##__VA_ARGS__); \
+} while(0)
+
+/*-------------------------------------------------------------------*/
 /* Function prototypes                                                */
 /*-------------------------------------------------------------------*/
 
@@ -63,6 +93,8 @@ static void build_sql_query(char *sql, size_t sql_len);
 static void build_sql_summary(char *sql, size_t sql_len);
 static const char *get_home_dir(void);
 static void print_file_head(const char *path, int lines);
+static void print_verbose_header(void);
+static void print_verbose_summary(void);
 
 /*-------------------------------------------------------------------*/
 /* Main                                                               */
@@ -125,6 +157,7 @@ int main(int argc, char *argv[])
     printf("==============================================\n\n");
     printf("Date:       %s\n", timestamp);
     printf("Output:     %s\n", g_output_file);
+    printf("Verbose:    %s\n", g_verbose ? "YES" : "NO");
     if (g_product_count > 0) {
         printf("Products:   ");
         for (int i = 0; i < g_product_count; i++) {
@@ -134,7 +167,13 @@ int main(int argc, char *argv[])
     } else {
         printf("Products:   ALL\n");
     }
+    printf("Mode:       %s\n", g_summary ? "Summary" : "Standard");
     printf("\n");
+
+    /* Print verbose header if enabled */
+    if (g_verbose) {
+        print_verbose_header();
+    }
 
     /* Build SQL query */
     if (g_summary) {
@@ -147,15 +186,20 @@ int main(int argc, char *argv[])
     snprintf(temp_sql_file, sizeof(temp_sql_file), "/tmp/listptf_%d.sql", getpid());
     snprintf(temp_out_file, sizeof(temp_out_file), "/tmp/listptf_%d.out", getpid());
 
+    LOG_DEBUG("Temp SQL file: %s", temp_sql_file);
+    LOG_DEBUG("Temp output file: %s", temp_out_file);
+
     fp = fopen(temp_sql_file, "w");
     if (fp == NULL) {
-        fprintf(stderr, "[ERROR] Cannot create temp file: %s\n", strerror(errno));
+        LOG_ERROR("Cannot create temp file: %s", strerror(errno));
         return 1;
     }
     fprintf(fp, "%s\n", sql);
     fclose(fp);
 
-    printf("[INFO] Querying PTF information...\n");
+    LOG_DEBUG("SQL written to temp file (%zu bytes)", strlen(sql));
+
+    LOG_INFO("Querying PTF information...");
 
     /*
      * Method 1: Use RUNSQLSTM to run SQL from file
@@ -165,12 +209,16 @@ int main(int argc, char *argv[])
              "RUNSQLSTM SRCSTMF('%s') COMMIT(*NONE) OUTPUT(*PRINT)",
              temp_sql_file);
 
+    LOG_CMD("CL Command: %s", cl_cmd);
+
 #ifdef __PASE__
     /*
      * systemCL() runs a CL command from PASE
      * Returns 0 on success, -1 on error
      */
+    LOG_CMD("Execution: systemCL(\"%s\", 0)", cl_cmd);
     rc = systemCL(cl_cmd, 0);
+    LOG_DEBUG("systemCL return code: %d", rc);
 #else
     /*
      * Fallback for non-PASE compilation (testing on other systems)
@@ -180,11 +228,13 @@ int main(int argc, char *argv[])
     snprintf(qsh_cmd, sizeof(qsh_cmd),
              "system \"%s\" > '%s' 2>&1",
              cl_cmd, temp_out_file);
+    LOG_CMD("Execution: system(\"%s\")", qsh_cmd);
     rc = system(qsh_cmd);
+    LOG_DEBUG("system() return code: %d", rc);
 #endif
 
     if (rc != 0) {
-        fprintf(stderr, "[WARN] RUNSQLSTM returned %d, trying db2 utility...\n", rc);
+        LOG_WARN("RUNSQLSTM returned %d, trying db2 utility...", rc);
 
         /*
          * Method 2: Use QShell db2 utility
@@ -195,17 +245,20 @@ int main(int argc, char *argv[])
                  "/QOpenSys/usr/bin/qsh -c \"db2 -t -f '%s'\" > '%s' 2>&1",
                  temp_sql_file, temp_out_file);
 
+        LOG_CMD("Fallback command: %s", db2_cmd);
+
 #ifdef __PASE__
         rc = system(db2_cmd);
 #else
         rc = system(db2_cmd);
 #endif
+        LOG_DEBUG("db2 utility return code: %d", rc);
     }
 
     /* Write header to output file */
     fp = fopen(g_output_file, "w");
     if (fp == NULL) {
-        fprintf(stderr, "[ERROR] Cannot create output file: %s\n", strerror(errno));
+        LOG_ERROR("Cannot create output file: %s", strerror(errno));
         unlink(temp_sql_file);
         return 1;
     }
@@ -237,10 +290,15 @@ int main(int argc, char *argv[])
     FILE *tmp_fp = fopen(temp_out_file, "r");
     if (tmp_fp != NULL) {
         char line[MAX_LINE_LEN];
+        int line_count = 0;
         while (fgets(line, sizeof(line), tmp_fp) != NULL) {
             fputs(line, fp);
+            line_count++;
         }
         fclose(tmp_fp);
+        LOG_DEBUG("Appended %d lines from query output", line_count);
+    } else {
+        LOG_DEBUG("No query output file found (this may be normal)");
     }
 
     fprintf(fp, "\n----------------------------------------------\n");
@@ -248,17 +306,83 @@ int main(int argc, char *argv[])
     fclose(fp);
 
     /* Clean up temp files */
+    LOG_DEBUG("Cleaning up temp files...");
     unlink(temp_sql_file);
     unlink(temp_out_file);
 
-    printf("[INFO] Output written to: %s\n\n", g_output_file);
+    LOG_INFO("Output written to: %s", g_output_file);
 
     /* Show first 30 lines */
-    printf("=== First 30 lines of output ===\n\n");
+    printf("\n=== First 30 lines of output ===\n\n");
     print_file_head(g_output_file, 30);
     printf("\n...\n(see %s for complete list)\n", g_output_file);
 
+    /* Print verbose summary if enabled */
+    if (g_verbose) {
+        print_verbose_summary();
+    }
+
     return 0;
+}
+
+/*-------------------------------------------------------------------*/
+/* Print verbose header showing commands that will be used            */
+/*-------------------------------------------------------------------*/
+
+static void print_verbose_header(void)
+{
+    printf("==============================================\n");
+    printf("COMMANDS THAT WILL BE USED:\n");
+    printf("==============================================\n\n");
+
+    printf("1. Write SQL to temp file:\n");
+    printf("   File: /tmp/listptf_<pid>.sql\n\n");
+
+    printf("2. Execute SQL via CL (primary method):\n");
+    printf("   CL: RUNSQLSTM SRCSTMF('<file>') COMMIT(*NONE) OUTPUT(*PRINT)\n");
+#ifdef __PASE__
+    printf("   Via: systemCL(\"<cl_command>\", 0)\n");
+#else
+    printf("   Via: system(\"system \\\"<cl_command>\\\"\")\n");
+#endif
+    printf("\n");
+
+    printf("3. Fallback method (if RUNSQLSTM fails):\n");
+    printf("   CMD: /QOpenSys/usr/bin/qsh -c \"db2 -t -f '<file>'\"\n");
+    printf("   Via: system(\"<command>\")\n\n");
+
+    printf("SQL Table:\n");
+    printf("   QSYS2.PTF_INFO\n\n");
+
+    printf("==============================================\n\n");
+}
+
+/*-------------------------------------------------------------------*/
+/* Print verbose summary                                              */
+/*-------------------------------------------------------------------*/
+
+static void print_verbose_summary(void)
+{
+    printf("\n==============================================\n");
+    printf("VERBOSE SUMMARY\n");
+    printf("==============================================\n\n");
+
+    printf("Output file: %s\n", g_output_file);
+    printf("Query type:  %s\n", g_summary ? "Summary" : "Standard");
+    printf("\n");
+
+    printf("Execution methods used:\n");
+#ifdef __PASE__
+    printf("  - systemCL() for CL commands\n");
+#else
+    printf("  - system() for shell commands\n");
+#endif
+    printf("  - /QOpenSys/usr/bin/qsh -c \"db2 ...\" for SQL\n");
+    printf("\n");
+
+    printf("SQL table queried:\n");
+    printf("  - QSYS2.PTF_INFO\n");
+    printf("\n");
 }
 
 /*-------------------------------------------------------------------*/
@@ -279,6 +403,9 @@ static void build_sql_query(char *sql, size_t sql_len)
             strcat(where_clause, "'");
         }
         strcat(where_clause, ")");
+        LOG_DEBUG("Product filter: %s", where_clause);
+    } else {
+        LOG_DEBUG("No product filter (querying ALL products)");
     }
 
     if (g_verbose) {
@@ -310,6 +437,8 @@ static void build_sql_query(char *sql, size_t sql_len)
             "ORDER BY PTF_PRODUCT_ID, PTF_IDENTIFIER",
             where_clause);
     }
+
+    LOG_SQL("%s", sql);
 }
 
 /*-------------------------------------------------------------------*/
@@ -330,6 +459,9 @@ static void build_sql_summary(char *sql, size_t sql_len)
             strcat(where_clause, "'");
         }
         strcat(where_clause, ")");
+        LOG_DEBUG("Product filter: %s", where_clause);
+    } else {
+        LOG_DEBUG("No product filter (querying ALL products)");
     }
 
     snprintf(sql, sql_len,
@@ -342,6 +474,8 @@ static void build_sql_summary(char *sql, size_t sql_len)
         "GROUP BY PTF_PRODUCT_ID, PTF_LOADED_STATUS "
         "ORDER BY PTF_PRODUCT_ID, PTF_LOADED_STATUS",
         where_clause);
+
+    LOG_SQL("%s", sql);
 }
 
 /*-------------------------------------------------------------------*/
@@ -399,7 +533,7 @@ static void usage(const char *prog)
     printf("Usage: %s [options] [product_id ...]\n\n", prog);
     printf("Options:\n");
     printf("  -o FILE   Write output to FILE (default: ~/ptf_list.txt)\n");
-    printf("  -v        Verbose output (more columns)\n");
+    printf("  -v        Verbose output (show SQL commands executed)\n");
     printf("  -s        Summary only (count by status)\n");
     printf("  -h        Show this help\n");
     printf("\nArguments:\n");
@@ -411,6 +545,12 @@ static void usage(const char *prog)
     printf("  %s 5770SS1 5770DG1        # OS and HTTP Server PTFs\n", prog);
     printf("  %s -s                     # Summary counts\n", prog);
     printf("  %s -v -o /tmp/ptfs.txt    # Verbose to specific file\n", prog);
+    printf("\nCL Commands Used:\n");
+    printf("  RUNSQLSTM SRCSTMF('<file>') COMMIT(*NONE) OUTPUT(*PRINT)\n");
+    printf("\nSQL Execution Method:\n");
+    printf("  /QOpenSys/usr/bin/qsh -c \"db2 -t -f '<file>'\"\n");
+    printf("\nSQL Table:\n");
+    printf("  QSYS2.PTF_INFO - PTF metadata and status\n");
     printf("\nPTF Status values:\n");
     printf("  NOT LOADED              - PTF save file exists but not loaded\n");
     printf("  LOADED                  - Loaded but not applied\n");

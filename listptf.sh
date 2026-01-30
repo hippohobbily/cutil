@@ -10,6 +10,7 @@
 #   ./listptf.sh 5770SS1            # List PTFs for specific product
 #   ./listptf.sh 5770SS1 5770WDS    # List PTFs for multiple products
 #   ./listptf.sh -o /tmp/ptfs.txt   # Specify output file
+#   ./listptf.sh -v                 # Verbose (show SQL commands)
 #   ./listptf.sh -h                 # Show help
 #
 # Output file: ~/ptf_list.txt (default)
@@ -27,8 +28,53 @@ OUTPUT_FILE="${HOME:-/QOpenSys/home/$USER}/ptf_list.txt"
 # Products to query (empty = all)
 PRODUCTS=""
 
+# Verbose mode (show SQL commands)
+VERBOSE=0
+
+# All columns mode
+ALL_COLUMNS=0
+
+# Summary mode
+SUMMARY=0
+
 #----------------------------------------------------------------------
-# Functions
+# Logging Functions
+#----------------------------------------------------------------------
+
+log_info() {
+    echo "[INFO] $1"
+}
+
+log_error() {
+    echo "[ERROR] $1" >&2
+}
+
+log_warn() {
+    echo "[WARN] $1"
+}
+
+log_debug() {
+    if [ $VERBOSE -eq 1 ]; then
+        echo "[DEBUG] $1"
+    fi
+}
+
+log_cmd() {
+    # Log the exact command being executed
+    if [ $VERBOSE -eq 1 ]; then
+        echo "[CMD] $1"
+    fi
+}
+
+log_sql() {
+    # Log SQL statement being executed
+    if [ $VERBOSE -eq 1 ]; then
+        echo "[SQL] $1"
+    fi
+}
+
+#----------------------------------------------------------------------
+# Usage
 #----------------------------------------------------------------------
 
 usage() {
@@ -40,8 +86,9 @@ USAGE:
 
 OPTIONS:
     -o FILE     Write output to FILE (default: ~/ptf_list.txt)
-    -a          Show all columns (verbose)
+    -a          Show all columns (more PTF details)
     -s          Summary only (count by status)
+    -v          Verbose mode (show exact SQL commands executed)
     -h          Show this help
 
 ARGUMENTS:
@@ -54,7 +101,8 @@ EXAMPLES:
     ./listptf.sh 5770SS1 5770DG1        # OS and HTTP Server PTFs
     ./listptf.sh -o /tmp/mylist.txt     # Custom output file
     ./listptf.sh -s                     # Summary counts only
-    ./listptf.sh -a 5770SS1             # Verbose output for OS
+    ./listptf.sh -a 5770SS1             # All columns for OS PTFs
+    ./listptf.sh -v 5770SS1             # Verbose mode showing SQL
 
 OUTPUT FORMAT:
     PTF_ID    PRODUCT    STATUS              ACTION_PENDING
@@ -70,15 +118,13 @@ STATUS VALUES:
     SUPERSEDED              - Replaced by newer PTF
     DAMAGED                 - PTF is damaged
 
+SQL TABLE:
+    QSYS2.PTF_INFO - PTF metadata and status
+
+EXECUTION METHOD:
+    /QOpenSys/usr/bin/qsh -c "db2 \"<sql>\""
+
 EOF
-}
-
-log_info() {
-    echo "[INFO] $1"
-}
-
-log_error() {
-    echo "[ERROR] $1" >&2
 }
 
 #----------------------------------------------------------------------
@@ -87,7 +133,24 @@ log_error() {
 
 run_sql() {
     _sql="$1"
-    /QOpenSys/usr/bin/qsh -c "db2 \"$_sql\"" 2>/dev/null
+    _db2_cmd="/QOpenSys/usr/bin/qsh -c \"db2 \\\"$_sql\\\"\""
+
+    log_sql "$_sql"
+    log_cmd "$_db2_cmd"
+
+    _result=$(/QOpenSys/usr/bin/qsh -c "db2 \"$_sql\"" 2>&1)
+    _rc=$?
+
+    if [ $VERBOSE -eq 1 ]; then
+        log_debug "SQL return code: $_rc"
+        if [ -n "$_result" ]; then
+            _lines=$(echo "$_result" | wc -l | tr -d ' ')
+            log_debug "SQL result: $_lines lines returned"
+        fi
+    fi
+
+    echo "$_result"
+    return $_rc
 }
 
 #----------------------------------------------------------------------
@@ -96,6 +159,7 @@ run_sql() {
 
 build_product_filter() {
     if [ -z "$PRODUCTS" ]; then
+        log_debug "No product filter (querying ALL products)"
         echo ""
         return
     fi
@@ -113,6 +177,7 @@ build_product_filter() {
     done
 
     _filter="${_filter})"
+    log_debug "Product filter: $_filter"
     echo "$_filter"
 }
 
@@ -140,14 +205,15 @@ FROM QSYS2.PTF_INFO
 $_where
 ORDER BY PTF_PRODUCT_ID, PTF_IDENTIFIER"
 
+    log_info "Executing PTF list query..."
     run_sql "$_sql"
 }
 
 #----------------------------------------------------------------------
-# List PTFs (verbose - all columns)
+# List PTFs (all columns)
 #----------------------------------------------------------------------
 
-list_ptfs_verbose() {
+list_ptfs_all_columns() {
     _filter=$(build_product_filter)
 
     if [ -n "$_filter" ]; then
@@ -177,6 +243,7 @@ FROM QSYS2.PTF_INFO
 $_where
 ORDER BY PTF_PRODUCT_ID, PTF_IDENTIFIER"
 
+    log_info "Executing PTF list query (all columns)..."
     run_sql "$_sql"
 }
 
@@ -202,6 +269,7 @@ $_where
 GROUP BY PTF_PRODUCT_ID, PTF_LOADED_STATUS
 ORDER BY PTF_PRODUCT_ID, PTF_LOADED_STATUS"
 
+    log_info "Executing PTF summary query..."
     run_sql "$_sql"
 }
 
@@ -210,19 +278,19 @@ ORDER BY PTF_PRODUCT_ID, PTF_LOADED_STATUS"
 #----------------------------------------------------------------------
 
 # Parse options
-VERBOSE=0
-SUMMARY=0
-
-while getopts "o:ash" opt; do
+while getopts "o:asvh" opt; do
     case $opt in
         o)
             OUTPUT_FILE="$OPTARG"
             ;;
         a)
-            VERBOSE=1
+            ALL_COLUMNS=1
             ;;
         s)
             SUMMARY=1
+            ;;
+        v)
+            VERBOSE=1
             ;;
         h)
             usage
@@ -248,6 +316,7 @@ echo ""
 echo "Date:       $(date)"
 echo "System:     $(hostname 2>/dev/null || echo 'unknown')"
 echo "Output:     $OUTPUT_FILE"
+echo "Verbose:    $([ $VERBOSE -eq 1 ] && echo 'YES' || echo 'NO')"
 
 if [ -n "$PRODUCTS" ]; then
     echo "Products:   $PRODUCTS"
@@ -255,7 +324,36 @@ else
     echo "Products:   ALL"
 fi
 
+if [ $SUMMARY -eq 1 ]; then
+    echo "Mode:       Summary (count by status)"
+elif [ $ALL_COLUMNS -eq 1 ]; then
+    echo "Mode:       All columns"
+else
+    echo "Mode:       Standard"
+fi
+
 echo ""
+
+if [ $VERBOSE -eq 1 ]; then
+    echo "=============================================="
+    echo "SQL COMMANDS THAT WILL BE USED:"
+    echo "=============================================="
+    echo ""
+    echo "Execution method:"
+    echo "  /QOpenSys/usr/bin/qsh -c \"db2 \\\"<sql>\\\"\""
+    echo ""
+    echo "SQL Table:"
+    echo "  QSYS2.PTF_INFO"
+    echo ""
+    echo "Columns available:"
+    echo "  PTF_IDENTIFIER, PTF_PRODUCT_ID, PTF_LOADED_STATUS,"
+    echo "  PTF_IPL_ACTION, PTF_ACTION_PENDING, PTF_IPL_REQUIRED,"
+    echo "  PTF_CREATION_TIMESTAMP, PTF_STATUS_TIMESTAMP,"
+    echo "  PTF_SAVE_FILE, PTF_SUPERSEDED_BY_PTF, etc."
+    echo ""
+    echo "=============================================="
+    echo ""
+fi
 
 # Run query and save to file
 log_info "Querying PTF information..."
@@ -280,10 +378,10 @@ log_info "Querying PTF information..."
         echo "=== PTF Summary by Product and Status ==="
         echo ""
         list_ptfs_summary
-    elif [ $VERBOSE -eq 1 ]; then
-        echo "=== PTF Details (Verbose) ==="
+    elif [ $ALL_COLUMNS -eq 1 ]; then
+        echo "=== PTF Details (All Columns) ==="
         echo ""
-        list_ptfs_verbose
+        list_ptfs_all_columns
     else
         echo "=== PTF List ==="
         echo ""
@@ -315,4 +413,18 @@ if [ $_rc -eq 0 ]; then
 else
     log_error "Query failed (rc=$_rc)"
     exit 1
+fi
+
+if [ $VERBOSE -eq 1 ]; then
+    echo ""
+    echo "=============================================="
+    echo "VERBOSE SUMMARY"
+    echo "=============================================="
+    echo ""
+    echo "Output file: $OUTPUT_FILE"
+    echo "Query type:  $([ $SUMMARY -eq 1 ] && echo 'Summary' || ([ $ALL_COLUMNS -eq 1 ] && echo 'All columns' || echo 'Standard'))"
+    echo ""
+    echo "SQL execution method:"
+    echo "  /QOpenSys/usr/bin/qsh -c \"db2 \\\"<sql>\\\"\""
+    echo ""
 fi
