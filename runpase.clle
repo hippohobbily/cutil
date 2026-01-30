@@ -1,0 +1,85 @@
+/* ================================================================= */
+/* RUNPASE - CL Program to Run PASE Commands                         */
+/* ================================================================= */
+/*                                                                   */
+/* This is the simplest way to run PASE commands from IBM i.         */
+/*                                                                   */
+/* Compile:                                                          */
+/*   CRTCLMOD MODULE(MYLIB/RUNPASE) SRCSTMF('/path/to/runpase.clle') */
+/*   CRTPGM PGM(MYLIB/RUNPASE) MODULE(MYLIB/RUNPASE)                 */
+/*                                                                   */
+/* Or using CRTBNDCL:                                                */
+/*   CRTBNDCL PGM(MYLIB/RUNPASE) SRCSTMF('/path/to/runpase.clle')    */
+/*                                                                   */
+/* Or from source physical file:                                     */
+/*   CRTBNDCL PGM(MYLIB/RUNPASE) SRCFILE(MYLIB/QCLSRC)               */
+/*                                                                   */
+/* Run:                                                              */
+/*   CALL RUNPASE                                                    */
+/*                                                                   */
+/* ================================================================= */
+
+PGM
+
+    /* Variables */
+    DCL VAR(&CMD) TYPE(*CHAR) LEN(512)
+    DCL VAR(&OUTPUT) TYPE(*CHAR) LEN(256)
+
+    /* ============================================================= */
+    /* Method 1: QSH CMD - Easiest way                               */
+    /* Output goes to stdout (QPRINT spool if batch)                 */
+    /* ============================================================= */
+
+    SNDPGMMSG MSG('Method 1: Running ps -eaf via QSH CMD...')
+
+    /* Run ps -eaf, show first 30 lines */
+    QSH CMD('ps -eaf | head -30')
+
+    SNDPGMMSG MSG('Method 1 complete.')
+
+    /* ============================================================= */
+    /* Method 2: QP2SHELL2 - Direct PASE call                        */
+    /* More control, can pass multiple arguments                     */
+    /* ============================================================= */
+
+    SNDPGMMSG MSG('Method 2: Running ps via QP2SHELL2...')
+
+    /* Call QP2SHELL2 with shell and command */
+    /* QP2SHELL2 expects null-terminated PASE-style arguments */
+    /* The easy way: call /QOpenSys/usr/bin/sh -c "command" */
+    CALL PGM(QP2SHELL2) PARM('/QOpenSys/usr/bin/sh' +
+                             '-c' +
+                             'ps -eaf | head -10')
+
+    SNDPGMMSG MSG('Method 2 complete.')
+
+    /* ============================================================= */
+    /* Method 3: Redirect output to IFS file                         */
+    /* Useful when you need to process output in RPG                 */
+    /* ============================================================= */
+
+    SNDPGMMSG MSG('Method 3: Redirect to /tmp/ps_output.txt...')
+
+    CHGVAR VAR(&OUTPUT) VALUE('/tmp/ps_output.txt')
+    CHGVAR VAR(&CMD) VALUE('ps -eaf > ' *CAT &OUTPUT)
+
+    QSH CMD(&CMD)
+
+    SNDPGMMSG MSG('Output written to ' *CAT &OUTPUT)
+
+    /* You can now read the file with: */
+    /* DSPF STMF('/tmp/ps_output.txt') */
+    /* Or SQL: SELECT * FROM TABLE(QSYS2.IFS_READ('/tmp/ps_output.txt')) */
+
+    /* ============================================================= */
+    /* Method 4: Specific ps options                                  */
+    /* ============================================================= */
+
+    SNDPGMMSG MSG('Method 4: Show only PASE processes...')
+
+    /* Show only processes with 'QP2' in the name (PASE processes) */
+    QSH CMD('ps -eaf | grep -i qp2 | head -20')
+
+    SNDPGMMSG MSG('All methods complete!')
+
+ENDPGM
